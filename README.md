@@ -1,27 +1,30 @@
 # All CPU Meter for Linux v0.1.0
 
-A compact Ubuntu desktop system monitor inspired by the classic Windows All CPU Meter gadget. The included configurator detects available hardware, lets the user choose the desired level of detail, and generates a matching Conky panel.
+A compact Ubuntu desktop system monitor inspired by the classic Windows All CPU Meter gadget. The included configurator detects available hardware, lets the user choose the desired level of detail, then generates and launches a matching Conky panel.  Nothing here is revolutionary, but it is very automated so that you can (hopefully, if everything works) get a nice little resource monitor on your desktop with just a few clicks.  Look at the bars dance.  Numbers be numberin'.  Aren't they pretty?
+
+<img width="180" alt="The Meter" src="https://github.com/user-attachments/assets/9fe9c8ca-8611-4178-8231-a5d3f49b20c1" />
+
+<img width="600" alt="Some Settings" src="https://github.com/user-attachments/assets/6815bc45-79c1-446a-a735-9dc129438a40" />
+
 
 ## Testing status
 
-This release has been tested on Ubuntu Desktop with an Intel CPU and Intel integrated graphics.
+This release has been tested on Ubuntu Desktop 26.04 with an Intel CPU and Intel integrated graphics.
 
-AMD CPU temperature handling, AMD GPU utilization, and NVIDIA GPU utilization are implemented but have not yet been tested on physical AMD or NVIDIA Linux systems. Treat those backends as experimental and please report any hardware-detection or display problems.
+AMD CPU temperature handling, AMD GPU utilization, and NVIDIA GPU utilization are implemented but have not been tested on actual hardware systems. Treat those backends as experimental.
 
 ## Displays
 
 Depending on detected hardware and selected options, the panel can show:
 
-- Overall CPU utilization and frequency
-- Per-logical-CPU utilization
-- Package temperature or per-core temperatures
-- RAM and optional swap usage
-- GPU utilization
+- Overall and per-core CPU utilization and frequency
+- Package and per-core temperatures
+- RAM and swap usage
+- GPU & VRAM utilization
 - Intel Render/3D, Video/QSV, and Video Enhance utilization
 - Root filesystem capacity and disk read/write activity
 - Network upload/download throughput and totals
 - Color-coded utilization bars
-- Optional trend graphs with a muted decorative grid
 
 CPU and GPU names can be cropped, wrapped, or replaced with a custom display name.
 
@@ -45,7 +48,7 @@ The installer uses `apt` to install the base requirements and installs the appli
 
 After installation, launch **All CPU Meter for Linux** from the Ubuntu application menu.
 
-## Optional dependencies
+### Optional dependencies
 
 The Hardware tab reports optional monitoring components that apply to the detected machine. Where appropriate, missing packages can be installed with the GUI's **Install** button.
 
@@ -56,30 +59,22 @@ The Hardware tab reports optional monitoring components that apply to the detect
 
 The application does not silently install optional monitoring tools.
 
-## Files
-
-Application:
-
-    ~/.local/share/allcpumeter-linux/allcpumeter.py
-
-Generated Conky configuration:
-
-    ~/.config/conky/allcpumeter-linux.conf
-
-Saved preferences:
-
-    ~/.config/allcpumeter-linux/settings.json
-
-Autostart entry, when enabled:
-
-    ~/.config/autostart/allcpumeter-linux.desktop
-
 ## Uninstall
 
 Run:
 
     ~/.local/share/allcpumeter-linux/uninstall.sh
 
+## AI & Safety Disclaimer
+
+The code and documentation included in this project is primarily vibeslop. The human writing this sentence in particular can barely code and doesn't really understand how any of this works. It Works On My Machine and hasn't caused my genitals to explode, but your mileage may vary. I make absolutely no guarantee as to the safety or security of the contents of this project. Use at your own risk. Or don't.
+
 ## Current scope
 
-v0.1.0 targets Ubuntu/Debian systems using `apt`. Desktop placement has been tested on Ubuntu GNOME. Other distributions and desktop environments may require adjustments.
+v0.1.0 targets Ubuntu/Debian systems using `apt`. Desktop placement has been tested on Ubuntu GNOME. Other distributions and desktop environments probably won't work without effort on your part.
+
+## License
+
+All CPU Meter for Linux is released into the public domain under [The Unlicense](LICENSE).
+
+Copyleft 2026. Do what thou wilt shall be the whole of the law. One step closer to AGI.
