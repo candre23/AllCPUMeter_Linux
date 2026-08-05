@@ -34,6 +34,7 @@ DEFAULTS = {
     'cpu_name_mode':'crop', 'cpu_custom_name':'',
     'gpu_name_mode':'crop', 'gpu_custom_name':'',
     'gpu_overall':True, 'gpu_render':True, 'gpu_video':True, 'gpu_video_enhance':False,
+    'gpu_vram':True,
     'settings_version':SETTINGS_SCHEMA_VERSION,
 }
 
@@ -303,13 +304,38 @@ def intel_gpu_stats(force=False):
 
 def gpu_value(vendor, amd_path='', metric='overall'):
     if vendor == 'nvidia':
-        rc,out,_=run(['nvidia-smi','--query-gpu=utilization.gpu','--format=csv,noheader,nounits'],2)
-        if rc==0 and out:
-            try: return float(out.splitlines()[0])
-            except Exception: pass
+        if metric in ('vram_used','vram_total','vram_percent'):
+            rc,out,_=run([
+                'nvidia-smi',
+                '--query-gpu=memory.used,memory.total',
+                '--format=csv,noheader,nounits'
+            ],2)
+            if rc==0 and out:
+                try:
+                    used,total=[float(x.strip()) for x in out.splitlines()[0].split(',')[:2]]
+                    if metric=='vram_used': return used
+                    if metric=='vram_total': return total
+                    return 0.0 if total <= 0 else (used/total)*100.0
+                except Exception:
+                    pass
+        else:
+            rc,out,_=run(['nvidia-smi','--query-gpu=utilization.gpu','--format=csv,noheader,nounits'],2)
+            if rc==0 and out:
+                try: return float(out.splitlines()[0])
+                except Exception: pass
     elif vendor == 'amd':
-        try: return float(Path(amd_path).read_text().strip())
-        except Exception: pass
+        try:
+            busy_path=Path(amd_path)
+            if metric in ('vram_used','vram_total','vram_percent'):
+                dev=busy_path.parent
+                used=float((dev/'mem_info_vram_used').read_text().strip())
+                total=float((dev/'mem_info_vram_total').read_text().strip())
+                if metric=='vram_used': return used/(1024*1024)
+                if metric=='vram_total': return total/(1024*1024)
+                return 0.0 if total <= 0 else (used/total)*100.0
+            return float(busy_path.read_text().strip())
+        except Exception:
+            pass
     elif vendor == 'intel':
         stats=intel_gpu_stats()
         v=stats.get(metric)
@@ -318,6 +344,17 @@ def gpu_value(vendor, amd_path='', metric='overall'):
 
 
 def helper_gpu(vendor, amd_path='', metric='overall'):
+    if metric=='vram_text':
+        used=gpu_value(vendor,amd_path,'vram_used')
+        total=gpu_value(vendor,amd_path,'vram_total')
+        if used is None or total is None or total <= 0:
+            print('N/A')
+        elif total >= 1024:
+            print(f'{used/1024:.2f} / {total/1024:.2f} GiB')
+        else:
+            print(f'{used:.0f} / {total:.0f} MiB')
+        return
+
     v=gpu_value(vendor,amd_path,metric)
     print('N/A' if v is None else f'{max(0,min(100,v)):.0f}')
 
@@ -708,7 +745,7 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--helper-temp',choices=['package','corelines'])
     ap.add_argument('--helper-gpu',choices=['intel','nvidia','amd'])
-    ap.add_argument('--metric',choices=['overall','render','video','videoenhance','compute'],default='overall')
+    ap.add_argument('--metric',choices=['overall','render','video','videoenhance','compute','vram_used','vram_total','vram_percent','vram_text'],default='overall')
     ap.add_argument('--amd-path',default='')
     ap.add_argument('--logical-count',type=int)
     ap.add_argument('--width',type=int,default=180)
