@@ -1,4 +1,4 @@
-# All CPU Meter for Linux v0.1.0
+# All CPU Meter for Linux v0.1.1
 
 A compact Ubuntu desktop system monitor inspired by the classic Windows All CPU Meter gadget. The included configurator detects available hardware, lets the user choose the desired level of detail, then generates and launches a matching Conky panel.  Nothing here is revolutionary, but it is very automated so that you can (hopefully, if everything works) get a nice little resource monitor on your desktop with just a few clicks.  Look at the bars dance.  Numbers be numberin'.  Aren't they pretty?
 
@@ -39,7 +39,7 @@ CPU and GPU names can be cropped, wrapped, or replaced with a custom display nam
 
 ## Install
 
-Extract the archive, open a Terminal in the extracted folder, and run:
+Clone the repo, navigate to the folder, and run:
 
     chmod +x install.sh
     ./install.sh
@@ -58,6 +58,10 @@ The Hardware tab reports optional monitoring components that apply to the detect
 - AMD GPU utilization: no extra package when the kernel exposes `gpu_busy_percent`
 
 The application does not silently install optional monitoring tools.
+
+### Upgrade All CPU Meter
+
+Do a git-pull and re-run the install script.
 
 ## Uninstall
 
