@@ -804,16 +804,13 @@ def generate_conky(hw, s):
     )
     text = '\n'.join(lines)
 
-    # Conky can have both the Wayland and X11 backends compiled in.  On a
-    # Wayland GNOME session, explicitly disable X11 so startup cannot touch
-    # Xwayland.  This avoids a GNOME/Xwayland startup crash observed when the
-    # meter autostarts during Remote Login session initialization.
-    return f"""local session_type = string.lower(os.getenv("XDG_SESSION_TYPE") or "")
-local use_wayland = (session_type == "wayland")
-
-conky.config = {{
-    out_to_x = not use_wayland,
-    out_to_wayland = use_wayland,
+    # GNOME/Mutter does not provide the layer-shell protocol Conky expects for
+    # native Wayland output, so use X11/Xwayland explicitly.  Autostart is
+    # handled by a readiness-aware launcher below so Conky does not race
+    # Xwayland during GNOME/RDP session initialization.
+    return f"""conky.config = {{
+    out_to_x = true,
+    out_to_wayland = false,
     update_interval = {interval},
     total_run_times = 0,
     double_buffer = true,
@@ -865,6 +862,56 @@ def start_meter():
     )
 
 
+def _x_socket_for_display(display):
+    """Return the expected X11 Unix socket path for DISPLAY, or None."""
+    if not display:
+        return None
+    m = re.match(r'^(?:[^:]*:)?(\d+)', display)
+    if not m:
+        return None
+    return Path('/tmp/.X11-unix') / ('X' + m.group(1))
+
+
+def autostart_launch(timeout=60, settle=5):
+    """Start Conky only after the current Xwayland display is actually ready."""
+    deadline = time.monotonic() + max(1, int(timeout))
+    display = os.environ.get('DISPLAY', '').strip()
+
+    # In GNOME's Wayland/RDP sessions DISPLAY may be exported before Xwayland
+    # has finished creating its socket.  Wait for both the variable and socket
+    # instead of letting Conky be the process that triggers Xwayland early.
+    while time.monotonic() < deadline:
+        if not display:
+            display = os.environ.get('DISPLAY', '').strip()
+
+        sock = _x_socket_for_display(display)
+        if display and sock and sock.exists():
+            # Verify that an X11 client can connect if xdpyinfo is available.
+            if shutil.which('xdpyinfo'):
+                rc, _, _ = run(
+                    ['xdpyinfo', '-display', display],
+                    timeout=2,
+                )
+                if rc == 0:
+                    break
+            else:
+                break
+
+        time.sleep(1)
+    else:
+        return 1
+
+    # Give GNOME/Xwayland a brief settling period after the display becomes
+    # usable.  This avoids the startup race that previously crashed Xwayland.
+    time.sleep(max(0, int(settle)))
+
+    try:
+        start_meter()
+        return 0
+    except Exception:
+        return 1
+
+
 def write_config(hw, s):
     CONKY_DIR.mkdir(parents=True, exist_ok=True)
     CONKY_FILE.write_text(generate_conky(hw, s))
@@ -876,7 +923,7 @@ def write_config(hw, s):
             f"""[Desktop Entry]
 Type=Application
 Name=All CPU Meter
-Exec=sh -c 'sleep 10; conky -c {CONKY_FILE}'
+Exec=python3 {SELF} --autostart-launch
 Terminal=false
 X-GNOME-Autostart-enabled=true
 """
@@ -1446,9 +1493,12 @@ def main():
     ap.add_argument('--logical-count', type=int)
     ap.add_argument('--width', type=int, default=180)
     ap.add_argument('--multicolor', type=int, default=1)
+    ap.add_argument('--autostart-launch', action='store_true')
     args = ap.parse_args()
 
-    if args.helper_temp:
+    if args.autostart_launch:
+        raise SystemExit(autostart_launch())
+    elif args.helper_temp:
         helper_temp(
             args.helper_temp,
             args.logical_count,
