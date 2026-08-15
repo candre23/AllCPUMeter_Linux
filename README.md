@@ -77,6 +77,10 @@ The code and documentation included in this project is primarily vibeslop. The h
 
 v0.1.0 targets Ubuntu/Debian systems using `apt`. Desktop placement has been tested on Ubuntu GNOME. Other distributions and desktop environments probably won't work without effort on your part.
 
+## Revision History
+
+v0.1.1 fixes a severe crash on startup introduced by a weyland update.
+
 ## License
 
 All CPU Meter for Linux is released into the public domain under [The Unlicense](LICENSE).
