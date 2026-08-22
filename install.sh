@@ -5,7 +5,7 @@ APP_DIR="$HOME/.local/share/allcpumeter-linux"
 BIN_DIR="$HOME/.local/bin"
 DESKTOP_DIR="$HOME/.local/share/applications"
 
-echo "All CPU Meter for Linux v0.1.1 installer"
+echo "All CPU Meter for Linux v0.1.2 installer"
 echo
 
 if ! command -v apt-get >/dev/null 2>&1; then
