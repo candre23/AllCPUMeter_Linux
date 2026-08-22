@@ -1,4 +1,4 @@
-# All CPU Meter for Linux v0.1.1
+# All CPU Meter for Linux v0.1.2
 
 A compact Ubuntu desktop system monitor inspired by the classic Windows All CPU Meter gadget. The included configurator detects available hardware, lets the user choose the desired level of detail, then generates and launches a matching Conky panel.  Nothing here is revolutionary, but it is very automated so that you can (hopefully, if everything works) get a nice little resource monitor on your desktop with just a few clicks.  Look at the bars dance.  Numbers be numberin'.  Aren't they pretty?
 
@@ -78,6 +78,8 @@ The code and documentation included in this project is primarily vibeslop. The h
 v0.1.0 targets Ubuntu/Debian systems using `apt`. Desktop placement has been tested on Ubuntu GNOME. Other distributions and desktop environments probably won't work without effort on your part.
 
 ## Revision History
+
+v0.1.2 fixes multi-GPU support and adds some safeties for different display configs.  It falls on its face with weyland + nvidia + RDP though, due to known conky issues.  This will be the final conky-based version before refactoring.
 
 v0.1.1 fixes a severe crash on startup introduced by a weyland update.
 
