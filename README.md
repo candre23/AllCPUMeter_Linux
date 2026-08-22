@@ -39,7 +39,7 @@ CPU and GPU names can be cropped, wrapped, or replaced with a custom display nam
 
 ## Install
 
-Clone the repo, navigate to the folder, and run:
+Download and extract a release zip or clone the repo.  Then navigate to the folder and run:
 
     chmod +x install.sh
     ./install.sh
