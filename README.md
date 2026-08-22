@@ -1,4 +1,4 @@
-# All CPU Meter for Linux v0.2.0
+# All CPU Meter for Linux v0.2.1
 
 A compact Ubuntu desktop system monitor inspired by the classic Windows All CPU Meter gadget. The included configurator detects available hardware, lets the user choose the desired level of detail, then generates and launches a matching Conky panel.  Nothing here is revolutionary, but it is very automated so that you can (hopefully, if everything works) get a nice little resource monitor on your desktop with just a few clicks.  Look at the bars dance.  Numbers be numberin'.  Aren't they pretty?
 
@@ -76,6 +76,8 @@ The code and documentation included in this project is primarily vibeslop. The h
 Targets Ubuntu/Debian systems using `apt`. Desktop placement is a bit wonky. Other distributions and desktop environments probably won't work without effort on your part.
 
 ## Revision History
+
+v0.2.1 Compact core display mode added.
 
 v0.2.0 GTK4 refactor. 
 
