@@ -5,42 +5,47 @@ APP_DIR="$HOME/.local/share/allcpumeter-linux"
 BIN_DIR="$HOME/.local/bin"
 DESKTOP_DIR="$HOME/.local/share/applications"
 
-echo "All CPU Meter for Linux v0.1.2 installer"
+echo "All CPU Meter for Linux v0.2.0 installer"
 echo
 
 if ! command -v apt-get >/dev/null 2>&1; then
-    echo "This release supports Ubuntu/Debian systems using apt."
+    echo "This release currently supports Ubuntu/Debian systems using apt."
     exit 1
 fi
 
-echo "Installing base requirements..."
+echo "Installing GTK4/Python requirements..."
 sudo apt-get update
-sudo apt-get install -y python3 python3-tk conky-all pciutils procps util-linux iproute2 pkexec
+sudo apt-get install -y \
+    python3 \
+    python3-gi \
+    gir1.2-gtk-4.0 \
+    pciutils \
+    procps \
+    util-linux \
+    lm-sensors
 
 mkdir -p "$APP_DIR" "$BIN_DIR" "$DESKTOP_DIR"
 cp allcpumeter.py "$APP_DIR/allcpumeter.py"
-cp uninstall.sh "$APP_DIR/uninstall.sh"
-chmod +x "$APP_DIR/allcpumeter.py" "$APP_DIR/uninstall.sh"
+chmod +x "$APP_DIR/allcpumeter.py"
 
-cat > "$BIN_DIR/allcpumeter-linux" <<'LAUNCHER'
+cat > "$BIN_DIR/allcpumeter-linux" <<'EOF'
 #!/usr/bin/env bash
 exec python3 "$HOME/.local/share/allcpumeter-linux/allcpumeter.py" "$@"
-LAUNCHER
+EOF
 chmod +x "$BIN_DIR/allcpumeter-linux"
 
-cat > "$DESKTOP_DIR/allcpumeter-linux.desktop" <<EOF2
+cat > "$DESKTOP_DIR/allcpumeter-linux.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=All CPU Meter for Linux
-Comment=Configure a compact desktop hardware meter
+Comment=Configure a compact GTK4 hardware meter
 Exec=$BIN_DIR/allcpumeter-linux
 Icon=utilities-system-monitor
 Terminal=false
 Categories=System;Monitor;
-EOF2
+EOF
+
 
 echo
 echo "Installation complete."
-echo "Launch 'All CPU Meter for Linux' from the Ubuntu application menu."
-echo "You can also start it from a terminal with:"
-echo "  $BIN_DIR/allcpumeter-linux"
+echo "Launch 'All CPU Meter for Linux' from the application menu."

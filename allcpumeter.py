@@ -3,1009 +3,1570 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
-import shlex
 import shutil
 import subprocess
+import struct
+import zlib
 import sys
-import textwrap
 import time
-import fcntl
+from collections import deque
 from pathlib import Path
 
-APP_HOME = Path.home() / '.local' / 'share' / 'allcpumeter-linux'
-CONKY_DIR = Path.home() / '.config' / 'conky'
-CONKY_FILE = CONKY_DIR / 'allcpumeter-linux.conf'
-AUTOSTART_DIR = Path.home() / '.config' / 'autostart'
-AUTOSTART_FILE = AUTOSTART_DIR / 'allcpumeter-linux.desktop'
-SETTINGS_DIR = Path.home() / '.config' / 'allcpumeter-linux'
-SETTINGS_FILE = SETTINGS_DIR / 'settings.json'
-SELF = APP_HOME / 'allcpumeter.py'
-APP_VERSION = '0.1.2'
-SETTINGS_SCHEMA_VERSION = 1
-PALETTE = ['C77DFF','FFD93D','00D9FF','FF5E5E','00FF66','5DA9FF','B8F34A','FF9F43']
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, Gio, GLib, Gdk, Pango
+
+APP_VERSION = "0.2.0"
+APP_ID = "io.github.allcpumeterlinux"
+APP_HOME = Path.home() / ".local" / "share" / "allcpumeter-linux"
+SETTINGS_DIR = Path.home() / ".config" / "allcpumeter-linux"
+SETTINGS_FILE = SETTINGS_DIR / "settings.json"
+AUTOSTART_DIR = Path.home() / ".config" / "autostart"
+AUTOSTART_FILE = AUTOSTART_DIR / "allcpumeter-linux.desktop"
+SELF = APP_HOME / "allcpumeter.py"
+
+PALETTE = [
+    "#c77dff", "#ffd93d", "#00d9ff", "#ff5e5e",
+    "#00ff66", "#5da9ff", "#b8f34a", "#ff9f43",
+]
 
 DEFAULTS = {
-    'preset':'detailed', 'per_core':True, 'temp_mode':'package', 'show_freq':True,
-    'show_swap':True, 'show_gpu':True, 'show_disk':True, 'show_network':True,
-    'trendlines':True, 'multicolor':True, 'autostart':True,
-    'alignment':'top_right', 'width':180, 'gap_x':12, 'gap_y':40, 'update_interval':1.0,
-    'cpu_name_mode':'crop', 'cpu_custom_name':'',
-    'gpu_name_mode':'crop', 'gpu_custom_name':'',
-    'gpu_overall':True, 'gpu_render':True, 'gpu_video':True, 'gpu_video_enhance':False,
-    'gpu_vram':True,
-    'settings_version':SETTINGS_SCHEMA_VERSION,
+    "width": 180,
+    "gap_x": 12,
+    "gap_y": 40,
+    "position": "top_right",
+    "update_interval": 1.0,
+    "per_core": True,
+    "cpu_detail": "logical",
+    "temp_mode": "package",
+    "show_freq": True,
+    "show_swap": True,
+    "show_network": True,
+    "show_disk": True,
+    "trendlines": True,
+    "multicolor": True,
+    "autostart": True,
+    "cpu_name_mode": "crop",
+    "cpu_custom_name": "",
+    "gpu_name_mode": "crop",
+    "gpu_custom_name": "",
+    "gpu_overall": True,
+    "gpu_render": True,
+    "gpu_video": True,
+    "gpu_video_enhance": False,
+    "gpu_vram": True,
+    "gpu_enabled": {},
+    "gpu_names": {},
 }
 
 
 def run(cmd, timeout=5):
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           text=True, timeout=timeout, check=False)
+        p = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=timeout, check=False
+        )
         return p.returncode, p.stdout.strip(), p.stderr.strip()
     except Exception as e:
-        return 127, '', str(e)
+        return 127, "", str(e)
 
 
-def cpu_info():
-    model = 'Unknown CPU'
+def load_settings():
+    out = dict(DEFAULTS)
     try:
-        for line in Path('/proc/cpuinfo').read_text(errors='replace').splitlines():
-            if line.lower().startswith('model name'):
-                model = line.split(':',1)[1].strip(); break
+        saved = json.loads(SETTINGS_FILE.read_text())
+        if isinstance(saved, dict):
+            out.update(saved)
     except Exception:
         pass
-    return {'model':model, 'logical_cpus':os.cpu_count() or 1}
+
+    return out
 
 
-def logical_core_ids():
-    """Return the physical core id corresponding to each logical CPU row."""
-    ids=[]
-    current={}
-    try:
-        for line in Path('/proc/cpuinfo').read_text(errors='replace').splitlines()+['']:
-            if not line.strip():
-                if current:
-                    try: ids.append(int(current.get('core id', len(ids))))
-                    except Exception: ids.append(len(ids))
-                    current={}
-                continue
-            if ':' in line:
-                k,v=line.split(':',1); current[k.strip().lower()]=v.strip()
-    except Exception:
-        pass
-    n=os.cpu_count() or 1
-    if len(ids) < n: ids.extend(range(len(ids),n))
-    return ids[:n]
+def save_settings(settings):
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
 
 
-def default_interface():
-    rc,out,_ = run(['ip','route','show','default'])
-    if rc == 0:
-        m = re.search(r'\bdev\s+(\S+)', out)
-        if m: return m.group(1)
-    base = Path('/sys/class/net')
-    if base.exists():
-        for p in sorted(base.iterdir()):
-            n = p.name
-            if n != 'lo' and not n.startswith(('docker','br-','veth','virbr','tun','tap')):
-                return n
-    return 'lo'
-
-
-def root_device():
-    rc,out,_ = run(['findmnt','-n','-o','SOURCE','/'])
-    s = out.strip() if rc == 0 else ''
-    return s[5:] if s.startswith('/dev/') else s
-
-
-def normalize_pci_bdf(value):
-    """Normalize PCI addresses from lspci/nvidia-smi to dddd:bb:dd.f."""
-    value=(value or '').strip().lower()
-    parts=value.split(':')
-    if len(parts)==3:
-        domain,bus,slot=parts
-        domain=domain[-4:].zfill(4)
-        return f'{domain}:{bus.zfill(2)}:{slot}'
+def normalize_bdf(value):
+    value = (value or "").strip().lower()
+    parts = value.split(":")
+    if len(parts) == 3:
+        return f"{parts[0][-4:].zfill(4)}:{parts[1].zfill(2)}:{parts[2]}"
     return value
 
 
-def nvidia_inventory():
-    """Return NVIDIA driver-visible GPUs keyed by normalized PCI BDF."""
-    if not shutil.which('nvidia-smi'):
-        return {}
-    rc,out,_=run([
-        'nvidia-smi',
-        '--query-gpu=index,uuid,pci.bus_id,name',
-        '--format=csv,noheader,nounits'
-    ],3)
-    if rc != 0:
-        return {}
-
-    found={}
-    for line in out.splitlines():
-        parts=[p.strip() for p in line.split(',',3)]
-        if len(parts) != 4:
-            continue
-        index,uuid,bdf,name=parts
-        found[normalize_pci_bdf(bdf)]={
-            'index':index,
-            'uuid':uuid,
-            'name':name,
-        }
-    return found
+def cpu_info():
+    model = "Unknown CPU"
+    logical = os.cpu_count() or 1
+    try:
+        for line in Path("/proc/cpuinfo").read_text(errors="replace").splitlines():
+            if line.lower().startswith("model name"):
+                model = line.split(":", 1)[1].strip()
+                break
+    except Exception:
+        pass
+    return {"model": model, "logical_cpus": logical}
 
 
-def drm_inventory():
-    """Return DRM/sysfs monitoring paths keyed by PCI BDF."""
-    found={}
-    for card in sorted(Path('/sys/class/drm').glob('card[0-9]*')):
-        device=card/'device'
+def logical_core_ids():
+    ids = []
+    current = {}
+    try:
+        for line in Path("/proc/cpuinfo").read_text(errors="replace").splitlines() + [""]:
+            if not line.strip():
+                if current:
+                    try:
+                        ids.append(int(current.get("core id", len(ids))))
+                    except Exception:
+                        ids.append(len(ids))
+                    current = {}
+                continue
+            if ":" in line:
+                k, v = line.split(":", 1)
+                current[k.strip().lower()] = v.strip()
+    except Exception:
+        pass
+    n = os.cpu_count() or 1
+    if len(ids) < n:
+        ids.extend(range(len(ids), n))
+    return ids[:n]
+
+
+
+def physical_core_groups():
+    """Group logical CPU indices by physical package/core topology."""
+    groups = {}
+    cpu_base = Path("/sys/devices/system/cpu")
+    for cpu_dir in sorted(cpu_base.glob("cpu[0-9]*"), key=lambda p: int(p.name[3:])):
         try:
-            resolved=device.resolve()
-            bdf=normalize_pci_bdf(resolved.name)
+            logical = int(cpu_dir.name[3:])
+            topo = cpu_dir / "topology"
+            package = int((topo / "physical_package_id").read_text().strip())
+            core = int((topo / "core_id").read_text().strip())
         except Exception:
             continue
-        found[bdf]={
-            'drm_card':card.name,
-            'sys_path':str(resolved),
-            'amd_busy_path':str(device/'gpu_busy_percent') if (device/'gpu_busy_percent').exists() else '',
-            'amd_vram_used':str(device/'mem_info_vram_used') if (device/'mem_info_vram_used').exists() else '',
-            'amd_vram_total':str(device/'mem_info_vram_total') if (device/'mem_info_vram_total').exists() else '',
-        }
-    return found
+        groups.setdefault((package, core), []).append(logical)
+
+    if not groups:
+        return [
+            {"package": 0, "core_id": i, "logicals": [i]}
+            for i in range(os.cpu_count() or 1)
+        ]
+
+    result = []
+    for (package, core), logicals in sorted(groups.items()):
+        result.append({
+            "package": package,
+            "core_id": core,
+            "logicals": sorted(logicals),
+        })
+    return result
+
+def default_interface():
+    rc, out, _ = run(["ip", "route", "show", "default"])
+    if rc == 0:
+        m = re.search(r"\bdev\s+(\S+)", out)
+        if m:
+            return m.group(1)
+    base = Path("/sys/class/net")
+    if base.exists():
+        for p in sorted(base.iterdir()):
+            n = p.name
+            if n != "lo" and not n.startswith(("docker", "br-", "veth", "virbr", "tun", "tap")):
+                return n
+    return "lo"
+
+
+def root_device():
+    rc, out, _ = run(["findmnt", "-n", "-o", "SOURCE", "/"])
+    s = out.strip() if rc == 0 else ""
+    if s.startswith("/dev/"):
+        s = s[5:]
+    return s
+
+
+def nvidia_inventory():
+    if not shutil.which("nvidia-smi"):
+        return {}
+    rc, out, _ = run([
+        "nvidia-smi",
+        "--query-gpu=index,uuid,pci.bus_id,name",
+        "--format=csv,noheader,nounits",
+    ], 3)
+    if rc != 0:
+        return {}
+    result = {}
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",", 3)]
+        if len(parts) == 4:
+            index, uuid, bdf, name = parts
+            result[normalize_bdf(bdf)] = {
+                "index": index, "uuid": uuid, "name": name
+            }
+    return result
 
 
 def classify_gpu_vendor(description):
-    """Classify the actual adapter vendor without substring false positives."""
-    low=(description or '').lower().strip()
-    if low.startswith('nvidia corporation') or low.startswith('nvidia '):
-        return 'nvidia'
-    if low.startswith('intel corporation') or low.startswith('intel '):
-        return 'intel'
-    if (low.startswith('advanced micro devices') or
-        low.startswith('amd ') or
-        low.startswith('ati technologies')):
-        return 'amd'
-    if low.startswith('aspeed technology') or low.startswith('aspeed '):
-        return 'aspeed'
-    return 'unknown'
+    low = (description or "").lower().strip()
+    if low.startswith("nvidia corporation") or low.startswith("nvidia "):
+        return "nvidia"
+    if low.startswith("intel corporation") or low.startswith("intel "):
+        return "intel"
+    if low.startswith("advanced micro devices") or low.startswith("amd ") or low.startswith("ati technologies"):
+        return "amd"
+    if low.startswith("aspeed technology") or low.startswith("aspeed "):
+        return "aspeed"
+    return "unknown"
 
 
 def gpu_info():
-    """Discover every display/3D adapter and attach a stable PCI identity."""
-    rc,out,_=run(['lspci','-D'])
-    found=[]
+    rc, out, _ = run(["lspci", "-D"])
     if rc != 0:
-        return found
+        return []
 
-    pattern=re.compile(
-        r'^(\S+)\s+(VGA compatible controller|3D controller|Display controller):\s*(.*)$',
-        re.I
+    nv = nvidia_inventory()
+    result = []
+    rx = re.compile(
+        r"^(\S+)\s+(VGA compatible controller|3D controller|Display controller):\s*(.*)$",
+        re.I,
     )
     for line in out.splitlines():
-        m=pattern.match(line.strip())
+        m = rx.match(line.strip())
         if not m:
             continue
-        bdf=normalize_pci_bdf(m.group(1))
-        description=m.group(3).strip()
-        vendor=classify_gpu_vendor(description)
-        found.append({
-            'key':bdf,
-            'bdf':bdf,
-            'vendor':vendor,
-            'description':description,
-        })
-
-    nv=nvidia_inventory()
-    drm=drm_inventory()
-
-    for gpu in found:
-        bdf=gpu['bdf']
-        gpu.update(drm.get(bdf,{}))
-        gpu.setdefault('sys_path',str(Path('/sys/bus/pci/devices')/bdf))
-
-        if gpu['vendor']=='nvidia':
-            info=nv.get(bdf,{})
-            gpu['nvidia_index']=info.get('index','')
-            gpu['nvidia_uuid']=info.get('uuid','')
-            gpu['backend_available']=bool(gpu['nvidia_uuid'])
-            gpu['backend_label']='nvidia-smi' if gpu['backend_available'] else 'NVIDIA driver counters unavailable'
-        elif gpu['vendor']=='amd':
-            gpu['backend_available']=bool(gpu.get('amd_busy_path'))
-            gpu['backend_label']='amdgpu sysfs' if gpu['backend_available'] else 'AMD utilization counter unavailable'
-        elif gpu['vendor']=='intel':
-            gpu['intel_device']='sys:'+gpu['sys_path']
-            gpu['backend_available']=shutil.which('intel_gpu_top') is not None
-            gpu['backend_label']='intel_gpu_top' if gpu['backend_available'] else 'intel-gpu-tools not installed'
+        bdf = normalize_bdf(m.group(1))
+        desc = m.group(3).strip()
+        vendor = classify_gpu_vendor(desc)
+        gpu = {
+            "key": bdf,
+            "bdf": bdf,
+            "vendor": vendor,
+            "description": desc,
+            "sys_path": str(Path("/sys/bus/pci/devices") / bdf),
+        }
+        dev = Path(gpu["sys_path"])
+        if vendor == "nvidia":
+            info = nv.get(bdf, {})
+            gpu["nvidia_uuid"] = info.get("uuid", "")
+            gpu["backend_available"] = bool(gpu["nvidia_uuid"])
+            gpu["backend_label"] = "nvidia-smi" if gpu["backend_available"] else "NVIDIA counters unavailable"
+        elif vendor == "amd":
+            busy = dev / "gpu_busy_percent"
+            gpu["amd_busy_path"] = str(busy) if busy.exists() else ""
+            gpu["backend_available"] = busy.exists()
+            gpu["backend_label"] = "amdgpu sysfs" if busy.exists() else "AMD counters unavailable"
+        elif vendor == "intel":
+            gpu["intel_device"] = "sys:" + gpu["sys_path"]
+            gpu["backend_available"] = shutil.which("intel_gpu_top") is not None
+            gpu["backend_label"] = "intel_gpu_top" if gpu["backend_available"] else "intel-gpu-tools not installed"
         else:
-            gpu['backend_available']=False
-            gpu['backend_label']='No supported utilization backend'
+            gpu["backend_available"] = False
+            gpu["backend_label"] = "No supported monitoring backend"
+        result.append(gpu)
+    return result
 
-    return found
+
+def scan_hardware():
+    return {
+        "cpu": cpu_info(),
+        "network": {"primary": default_interface()},
+        "disk": {"root_device": root_device()},
+        "gpus": gpu_info(),
+        "sensors_installed": shutil.which("sensors") is not None,
+    }
 
 
 def read_sensor_items():
-    if not shutil.which('sensors'): return []
-    rc,out,_ = run(['sensors','-j'])
-    if rc != 0: return []
-    try: data=json.loads(out)
-    except Exception: return []
-    items=[]
+    if not shutil.which("sensors"):
+        return []
+    rc, out, _ = run(["sensors", "-j"], 4)
+    if rc != 0:
+        return []
+    try:
+        data = json.loads(out)
+    except Exception:
+        return []
+    found = []
     for chip in data.values():
-        if not isinstance(chip,dict): continue
-        for label,vals in chip.items():
-            if not isinstance(vals,dict): continue
-            for k,v in vals.items():
-                if str(k).endswith('_input') and isinstance(v,(int,float)):
-                    items.append((label,float(v))); break
-    return items
-
-
-def sensors_status():
-    installed=shutil.which('sensors') is not None
-    items=read_sensor_items() if installed else []
-    cores=set(); package=False
-    for label,_ in items:
-        low=label.lower()
-        if any(x in low for x in ('package','tctl','tdie','cpu')): package=True
-        m=re.search(r'core\s*(\d+)', low)
-        if m: cores.add(int(m.group(1)))
-    return {'installed':installed,'usable':bool(items),'package_temp':package,'core_temps':len(cores)}
-
-
-
-
-def scan():
-    gpus=gpu_info()
-    return {
-        'cpu':cpu_info(),
-        'network':{'primary':default_interface()},
-        'disk':{'root_device':root_device()},
-        'gpus':gpus,
-        'sensors':sensors_status(),
-        'intel_gpu':{'installed':shutil.which('intel_gpu_top') is not None},
-        'nvidia':{'installed':shutil.which('nvidia-smi') is not None},
-    }
+        if not isinstance(chip, dict):
+            continue
+        for label, values in chip.items():
+            if not isinstance(values, dict):
+                continue
+            for k, v in values.items():
+                if str(k).endswith("_input") and isinstance(v, (int, float)):
+                    found.append((label, float(v)))
+                    break
+    return found
 
 
 def package_temp(items):
-    for needle in ('package id 0','package','tctl','tdie','cpu'):
-        for label,val in items:
-            if needle in label.lower(): return val
+    for needle in ("package id 0", "package", "tctl", "tdie", "cpu"):
+        for label, value in items:
+            if needle in label.lower():
+                return value
     return items[0][1] if items else None
 
 
-def helper_temp(mode, logical_count=None, width=180, multicolor=True):
-    items=read_sensor_items()
-
-    if mode == 'package':
-        v=package_temp(items)
-        print('N/A' if v is None else f'{v:.0f}°C')
-        return
-
-    core_temps={}
-    for label,val in items:
-        m=re.search(r'core\s*(\d+)',label.lower())
+def per_core_temps(items):
+    out = {}
+    for label, value in items:
+        m = re.search(r"core\s*(\d+)", label.lower())
         if m:
-            core_temps[int(m.group(1))]=val
-
-    count=int(logical_count or (os.cpu_count() or 1))
-    core_ids=logical_core_ids()
-    bar_width=max(42,int(width)-115)
-    for i in range(1,count+1):
-        color=metric_color(i-1,bool(multicolor))
-        physical_core=core_ids[i-1] if i-1 < len(core_ids) else i-1
-        temp=core_temps.get(physical_core)
-        temp_text=f'{temp:.0f}°C' if temp is not None else '--°C'
-        print(
-            f'${{color {color}}}CPU {i:02d} '
-            f'${{cpubar cpu{i} 6,{bar_width}}} '
-            f'${{alignr}}{temp_text} ${{cpu cpu{i}}}%'
-        )
+            out[int(m.group(1))] = value
+    return out
 
 
-def _busy_number(value):
+def cpu_frequency_ghz():
+    vals = []
+    base = Path("/sys/devices/system/cpu")
+    for p in base.glob("cpu[0-9]*/cpufreq/scaling_cur_freq"):
+        try:
+            vals.append(float(p.read_text().strip()) / 1_000_000.0)
+        except Exception:
+            pass
+    if vals:
+        return sum(vals) / len(vals)
+    return 0.0
+
+
+def read_proc_stat():
+    overall = None
+    cores = []
     try:
-        return max(0.0, min(100.0, float(value)))
+        for line in Path("/proc/stat").read_text().splitlines():
+            if not line.startswith("cpu"):
+                continue
+            parts = line.split()
+            name = parts[0]
+            vals = [int(x) for x in parts[1:]]
+            idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+            total = sum(vals)
+            row = (idle, total)
+            if name == "cpu":
+                overall = row
+            elif name[3:].isdigit():
+                cores.append(row)
     except Exception:
-        return None
+        pass
+    return overall, cores
 
 
-def _intel_parse_json(text):
-    """Return normalized Intel engine utilization from intel_gpu_top JSON."""
-    text=(text or '').strip()
-    if not text:
-        return {'error':'intel_gpu_top returned no data'}
-    try:
-        data=json.loads(text)
-    except Exception as e:
-        # Tolerate older intel_gpu_top JSON output with a trailing comma or
-        # an unterminated array.
-        cleaned=re.sub(r',\s*]', ']', text)
-        if cleaned.startswith('[') and not cleaned.endswith(']'):
-            cleaned += ']'
-        try: data=json.loads(cleaned)
-        except Exception: return {'error':f'Could not parse intel_gpu_top JSON: {e}'}
-    if isinstance(data,list):
-        samples=[x for x in data if isinstance(x,dict)]
-        if not samples: return {'error':'intel_gpu_top returned no samples'}
-        sample=samples[-1]
-    elif isinstance(data,dict):
-        sample=data
-    else:
-        return {'error':'Unexpected intel_gpu_top data format'}
-
-    engines=sample.get('engines',{}) if isinstance(sample,dict) else {}
-    vals={}
-    if isinstance(engines,dict):
-        for name,info in engines.items():
-            if isinstance(info,dict):
-                v=_busy_number(info.get('busy'))
-                if v is not None: vals[str(name)]=v
-
-    def by_names(*names):
-        for wanted in names:
-            for k,v in vals.items():
-                if k.lower().replace(' ','') == wanted.lower().replace(' ',''):
-                    return v
+def cpu_usage(prev, cur):
+    if not prev or not cur:
         return 0.0
+    idle_delta = cur[0] - prev[0]
+    total_delta = cur[1] - prev[1]
+    if total_delta <= 0:
+        return 0.0
+    return max(0.0, min(100.0, (1.0 - idle_delta / total_delta) * 100.0))
 
-    render=by_names('Render/3D','Render','3D')
-    video=by_names('Video')
-    enhance=by_names('VideoEnhance','Video Enhance')
-    compute=by_names('Compute')
-    overall=max(vals.values()) if vals else None
-    if overall is None:
-        return {'error':'No Intel GPU engine counters were returned'}
+
+def mem_stats():
+    vals = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            vals[k] = int(v.strip().split()[0]) * 1024
+    except Exception:
+        pass
+    total = vals.get("MemTotal", 0)
+    available = vals.get("MemAvailable", 0)
+    used = max(0, total - available)
+    swap_total = vals.get("SwapTotal", 0)
+    swap_free = vals.get("SwapFree", 0)
     return {
-        'overall':overall, 'render':render, 'video':video,
-        'videoenhance':enhance, 'compute':compute,
-        'engines':vals, 'error':''
+        "total": total,
+        "used": used,
+        "percent": 0 if total <= 0 else used / total * 100.0,
+        "swap_total": swap_total,
+        "swap_used": max(0, swap_total - swap_free),
+        "swap_percent": 0 if swap_total <= 0 else (swap_total - swap_free) / swap_total * 100.0,
     }
 
 
-def intel_gpu_stats(force=False, device=''):
-    """Sample Intel GPU once and cache it so several Conky rows share one PMU read."""
-    cache_dir=Path.home()/'.cache'/'allcpumeter-linux'
-    suffix=re.sub(r'[^A-Za-z0-9_.-]+','_',device or 'default')
-    cache=cache_dir/f'intel-gpu-{suffix}.json'; lock_path=cache_dir/f'intel-gpu-{suffix}.lock'
-    cache_dir.mkdir(parents=True,exist_ok=True)
-
-    def cached_fresh():
-        try:
-            if force or time.time()-cache.stat().st_mtime > 1.25: return None
-            d=json.loads(cache.read_text())
-            return d if isinstance(d,dict) else None
-        except Exception: return None
-
-    hit=cached_fresh()
-    if hit is not None: return hit
-
+def net_bytes(iface):
     try:
-        with lock_path.open('w') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
-            hit=cached_fresh()
-            if hit is not None: return hit
-            if not shutil.which('intel_gpu_top'):
-                result={'error':'intel_gpu_top is not installed'}
-            else:
-                # Use two finite samples so the final JSON is complete and the
-                # second sample contains a real utilization interval.
-                cmd=['intel_gpu_top']
-                if device:
-                    cmd += ['-d',device]
-                cmd += ['-J','-s','500','-n','2','-o','-']
-                rc,out,err=run(cmd,timeout=3.5)
-                if rc != 0:
-                    msg=(err or out or f'intel_gpu_top exited with code {rc}').strip()
-                    result={'error':msg.splitlines()[-1] if msg else 'intel_gpu_top failed'}
-                else:
-                    result=_intel_parse_json(out)
-            try: cache.write_text(json.dumps(result))
-            except Exception: pass
-            return result
-    except Exception as e:
-        return {'error':str(e)}
+        for line in Path("/proc/net/dev").read_text().splitlines():
+            if ":" not in line:
+                continue
+            name, rest = line.split(":", 1)
+            if name.strip() != iface:
+                continue
+            parts = rest.split()
+            return int(parts[0]), int(parts[8])
+    except Exception:
+        pass
+    return 0, 0
 
 
-def gpu_value(vendor, amd_path='', metric='overall', gpu_id='', intel_device=''):
-    if vendor == 'nvidia':
-        prefix=['nvidia-smi']
-        if gpu_id:
-            prefix += ['-i',gpu_id]
+def disk_stats(device):
+    base = device.rsplit("/", 1)[-1]
+    try:
+        for line in Path("/proc/diskstats").read_text().splitlines():
+            parts = line.split()
+            if len(parts) < 14 or parts[2] != base:
+                continue
+            sectors_read = int(parts[5])
+            sectors_written = int(parts[9])
+            return sectors_read * 512, sectors_written * 512
+    except Exception:
+        pass
+    return 0, 0
 
-        if metric in ('vram_used','vram_total','vram_percent'):
-            rc,out,_=run(prefix+[
-                '--query-gpu=memory.used,memory.total',
-                '--format=csv,noheader,nounits'
-            ],2)
-            if rc==0 and out:
-                try:
-                    used,total=[float(x.strip()) for x in out.splitlines()[0].split(',')[:2]]
-                    if metric=='vram_used': return used
-                    if metric=='vram_total': return total
-                    return 0.0 if total <= 0 else (used/total)*100.0
-                except Exception:
-                    pass
-        else:
-            rc,out,_=run(prefix+[
-                '--query-gpu=utilization.gpu',
-                '--format=csv,noheader,nounits'
-            ],2)
-            if rc==0 and out:
-                try: return float(out.splitlines()[0])
-                except Exception: pass
 
-    elif vendor == 'amd':
-        try:
-            busy_path=Path(amd_path)
-            if metric in ('vram_used','vram_total','vram_percent'):
-                dev=busy_path.parent
-                used=float((dev/'mem_info_vram_used').read_text().strip())
-                total=float((dev/'mem_info_vram_total').read_text().strip())
-                if metric=='vram_used': return used/(1024*1024)
-                if metric=='vram_total': return total/(1024*1024)
-                return 0.0 if total <= 0 else (used/total)*100.0
-            return float(busy_path.read_text().strip())
-        except Exception:
-            pass
+def root_fs_stats():
+    st = os.statvfs("/")
+    total = st.f_blocks * st.f_frsize
+    free = st.f_bavail * st.f_frsize
+    used = total - free
+    return used, total, (0 if total <= 0 else used / total * 100.0)
 
-    elif vendor == 'intel':
-        stats=intel_gpu_stats(device=intel_device)
-        v=stats.get(metric)
-        if isinstance(v,(int,float)):
-            return float(v)
 
+def format_bytes(value):
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    v = float(value)
+    for unit in units:
+        if abs(v) < 1024.0 or unit == units[-1]:
+            return f"{v:.1f} {unit}" if unit != "B" else f"{v:.0f} B"
+        v /= 1024.0
+
+
+
+def gpu_hwmon_temp(gpu):
+    """Best-effort PCI-device temperature in Celsius."""
+    dev = Path(gpu.get("sys_path", ""))
+    candidates = []
+    for hwmon in dev.glob("hwmon/hwmon*"):
+        for temp_file in sorted(hwmon.glob("temp*_input")):
+            try:
+                value = float(temp_file.read_text().strip())
+                if value > 1000:
+                    value /= 1000.0
+                if -20 <= value <= 150:
+                    candidates.append(value)
+            except Exception:
+                pass
+    return candidates[0] if candidates else None
+
+
+def intel_clock_mhz(gpu):
+    """Read a current Intel GT clock from sysfs when exposed."""
+    dev = Path(gpu.get("sys_path", ""))
+    patterns = (
+        "drm/card*/gt_cur_freq_mhz",
+        "drm/card*/gt/gt*/freq0/cur_freq",
+        "drm/card*/device/gt_cur_freq_mhz",
+    )
+    for pattern in patterns:
+        for p in dev.glob(pattern):
+            try:
+                return float(p.read_text().strip())
+            except Exception:
+                pass
     return None
 
 
-def helper_gpu(vendor, amd_path='', metric='overall', gpu_id='', intel_device=''):
-    if metric=='vram_text':
-        used=gpu_value(vendor,amd_path,'vram_used',gpu_id,intel_device)
-        total=gpu_value(vendor,amd_path,'vram_total',gpu_id,intel_device)
-        if used is None or total is None or total <= 0:
-            print('N/A')
-        elif total >= 1024:
-            print(f'{used/1024:.2f} / {total/1024:.2f} GiB')
-        else:
-            print(f'{used:.0f} / {total:.0f} MiB')
-        return
-
-    v=gpu_value(vendor,amd_path,metric,gpu_id,intel_device)
-    print('N/A' if v is None else f'{max(0,min(100,v)):.0f}')
-
-
-def intel_gpu_probe(device=''):
-    if not shutil.which('intel_gpu_top'):
-        return {'installed':False,'usable':False,'error':'not installed','engines':[]}
-    d=intel_gpu_stats(force=True,device=device)
-    return {
-        'installed':True,
-        'usable':not bool(d.get('error')),
-        'error':d.get('error',''),
-        'engines':sorted((d.get('engines') or {}).keys()),
-    }
-
-def load_settings():
-    settings=dict(DEFAULTS)
+def amd_clock_mhz(gpu):
+    """Read the active AMD core clock from pp_dpm_sclk when exposed."""
+    p = Path(gpu.get("sys_path", "")) / "pp_dpm_sclk"
     try:
-        saved=json.loads(SETTINGS_FILE.read_text())
-        if isinstance(saved,dict):
-            settings.update(saved)
+        for line in p.read_text().splitlines():
+            if "*" not in line:
+                continue
+            m = re.search(r"([0-9.]+)\\s*(MHz|Mhz|mhz)", line)
+            if m:
+                return float(m.group(1))
     except Exception:
         pass
-    settings['settings_version']=SETTINGS_SCHEMA_VERSION
-    return settings
+    return None
 
-
-def save_settings(s):
-    SETTINGS_DIR.mkdir(parents=True,exist_ok=True)
-    SETTINGS_FILE.write_text(json.dumps(s,indent=2))
-
-
-def section(title): return f'${{color FFFFFF}}${{font Sans:bold:size=10}}{title}${{font}}${{hr 1}}'
-def metric_color(i,multi): return PALETTE[i%len(PALETTE)] if multi else '57C7FF'
-
-
-def _png_chunk(kind,data):
-    import struct,zlib
-    return struct.pack(">I",len(data))+kind+data+struct.pack(">I",zlib.crc32(kind+data)&0xffffffff)
-
-
-def write_grid_png(lines,width,logical_cpus):
-    """Generate one transparent PNG containing all decorative graph grids."""
-    import struct,zlib
-    boxes=grid_boxes_for_lines(lines,width,logical_cpus)
-
-    # Transparent pixels outside the graph grids do not affect the panel.
-    canvas_w=max(180,int(width))
-    canvas_h=max(800,int(max((y+h for _,y,_,h in boxes),default=700)+20))
-
-    # Start with a fully transparent RGBA buffer.
-    rows=[bytearray(canvas_w*4) for _ in range(canvas_h)]
-
-    # Keep the decorative grid subtle so the metric traces remain dominant.
-    rgba=(112,112,112,72)
-
-    def pixel(x,y):
-        if 0 <= x < canvas_w and 0 <= y < canvas_h:
-            i=x*4
-            rows[y][i:i+4]=bytes(rgba)
-
-    for x,y,w,h in boxes:
-        x=int(round(x)); y=int(round(y)); w=int(round(w)); h=int(round(h))
-
-        # Six vertical columns: five interior rules.
-        for i in range(1,6):
-            gx=int(round(x+(w*i/6)))
-            for yy in range(y,y+h+1):
-                pixel(gx,yy)
-
-        # Four horizontal bands: three interior rules.
-        for i in range(1,4):
-            gy=int(round(y+(h*i/4)))
-            for xx in range(x,x+w+1):
-                pixel(xx,gy)
-
-    raw=b"".join(b"\x00"+bytes(row) for row in rows)
-    png=(b"\x89PNG\r\n\x1a\n"
-         +_png_chunk(b"IHDR",struct.pack(">IIBBBBB",canvas_w,canvas_h,8,6,0,0,0))
-         +_png_chunk(b"IDAT",zlib.compress(raw,9))
-         +_png_chunk(b"IEND",b""))
-
-    path=APP_HOME/"grid_overlay.png"
-    path.write_bytes(png)
-    return path
-
-
-def grid_boxes_for_lines(lines,width,logical_cpus):
-    """Estimate graph rectangles from Conky's fixed text flow for the generated panel."""
-    x=9.0
-    graph_w=max(120.0,float(width)-18.0)
-    y=8.0
-    boxes=[]
-
-    # These offsets match Conky's rendered text flow for this compact layout.
-    graph_y_offset=13.0
-    graph_index=0
-
-    for line in lines:
-        graph_h=0
-        for token,h in (
-            ('cpugraph ',34),('memgraph ',28),('execigraph ',28),
-            ('downspeedgraph ',32),('diskiograph_read ',28)
-        ):
-            if token in line:
-                graph_h=h
-                break
-
-        if graph_h:
-            # Each completed instrument section adds spacing not represented by
-            # the simple line-height estimate.
-            cumulative_section_offset=20.0*graph_index
-            boxes.append((
-                x+1.0,
-                y+graph_y_offset+cumulative_section_offset,
-                graph_w-2.0,
-                float(graph_h)-2.0
-            ))
-            graph_index += 1
-            y += float(graph_h)
+def intel_gpu_stats(device=""):
+    cmd = ["intel_gpu_top"]
+    if device:
+        cmd += ["-d", device]
+    cmd += ["-J", "-s", "250", "-n", "2", "-o", "-"]
+    rc, out, err = run(cmd, 2.5)
+    if rc != 0 or not out:
+        return {}
+    cleaned = out.strip()
+    try:
+        data = json.loads(cleaned)
+    except Exception:
+        cleaned = re.sub(r",\s*]", "]", cleaned)
+        if not cleaned.endswith("]"):
+            cleaned += "]"
+        try:
+            data = json.loads(cleaned)
+        except Exception:
+            return {}
+    samples = data if isinstance(data, list) else [data]
+    sample = samples[-1] if samples else {}
+    engines = sample.get("engines", {}) if isinstance(sample, dict) else {}
+    result = {"overall": 0.0, "render": 0.0, "video": 0.0, "videoenhance": 0.0}
+    for name, values in engines.items():
+        if not isinstance(values, dict):
             continue
-
-        if '--helper-temp corelines' in line:
-            y += 13.0 * max(1,int(logical_cpus))
-        elif '${font Sans:bold:size=10}' in line:
-            y += 15.0
-        elif line == '':
-            y += 9.0
-        else:
-            y += 13.0
-
-    return boxes
-
-def display_name_lines(detected,mode,custom,width):
-    """Format a detected hardware name according to Crop, Wrap or Custom."""
-    detected=(detected or '').replace('$','').strip()
-    custom=(custom or '').replace('$','').strip()
-    text=custom if mode=='custom' and custom else detected
-    if mode!='wrap': return [text]
-    # Estimate characters that fit inside the configured panel width.
-    chars=max(16,int((int(width)-16)/6.1))
-    return textwrap.wrap(text,width=chars,break_long_words=False,break_on_hyphens=False) or ['']
+        busy = values.get("busy", 0)
+        try:
+            busy = float(busy)
+        except Exception:
+            busy = 0.0
+        low = name.lower()
+        result["overall"] = max(result["overall"], busy)
+        if "render" in low or "3d" in low:
+            result["render"] = max(result["render"], busy)
+        if "videoenhance" in low or "video enhance" in low:
+            result["videoenhance"] = max(result["videoenhance"], busy)
+        elif "video" in low:
+            result["video"] = max(result["video"], busy)
+    # Frequency is not consistently present in intel_gpu_top JSON across
+    # generations, so sysfs is used by gpu_stats() as the first choice.
+    return result
 
 
-def generate_conky(hw,s):
-    cpu=hw['cpu']; iface=hw['network']['primary']; rootdev=hw['disk']['root_device']; gpus=hw.get('gpus',[])
-    py=shlex.quote(str(SELF))
-    width=max(150,min(500,int(s['width'])))
-    bar_width=max(42,width-115)
-    lines=[section('CPU METER')]
-    for name_line in display_name_lines(cpu['model'],s.get('cpu_name_mode','crop'),s.get('cpu_custom_name',''),width):
-        lines.append('${color AAAAAA}'+name_line)
-    lines += ['${color 00FF66}CPU ${alignr}${cpu cpu0}%', '${color 00FF66}${cpubar cpu0 7,0}']
-    if s['show_freq']: lines.append('${color AAAAAA}Frequency ${alignr}${freq_g} GHz')
-    if s['temp_mode']=='package' and hw['sensors']['installed']:
-        lines.append('${color AAAAAA}Temperature ${alignr}${execi 2 python3 '+py+' --helper-temp package}')
-    if s['per_core']:
-        if s['temp_mode']=='cores' and hw['sensors']['installed']:
-            multi='1' if s['multicolor'] else '0'
-            lines.append('${execpi 1 python3 '+py+f' --helper-temp corelines --logical-count {int(cpu["logical_cpus"])} --width {width} --multicolor {multi}'+'}')
-        else:
-            for i in range(1,int(cpu['logical_cpus'])+1):
-                c=metric_color(i-1,s['multicolor'])
-                lines.append(f'${{color {c}}}CPU {i:02d} ${{cpubar cpu{i} 6,{bar_width}}} ${{alignr}}${{cpu cpu{i}}}%')
-    if s['trendlines']: lines.append('${color 00FF66}${cpugraph cpu0 34,0 00FF66 00FF66}')
+def nvidia_stats(uuid):
+    if not uuid:
+        return {}
+    rc, out, _ = run([
+        "nvidia-smi", "-i", uuid,
+        "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,clocks.current.graphics",
+        "--format=csv,noheader,nounits",
+    ], 2)
+    if rc != 0 or not out:
+        return {}
+    try:
+        util, used, total, temp, clock = [
+            float(x.strip()) for x in out.splitlines()[0].split(",")[:5]
+        ]
+        return {
+            "overall": util,
+            "vram_used_mib": used,
+            "vram_total_mib": total,
+            "vram_percent": 0 if total <= 0 else used / total * 100.0,
+            "temp": temp,
+            "clock_mhz": clock,
+        }
+    except Exception:
+        return {}
 
-    lines += ['',section('MEMORY'),'${color 5DA9FF}RAM ${alignr}${mem} / ${memmax}  ${memperc}%','${color 5DA9FF}${membar 7,0}']
-    if s['show_swap']:
-        lines += ['${color FFD93D}Swap ${alignr}${swap} / ${swapmax}  ${swapperc}%','${color FFD93D}${swapbar 6,0}']
-    if s['trendlines']: lines.append('${color 5DA9FF}${memgraph 28,0 5DA9FF 5DA9FF}')
 
-    enabled_map=s.get('gpu_enabled',{})
-    selected_gpus=[
-        g for g in gpus
-        if bool(enabled_map.get(g.get('key',''),g.get('backend_available',False)))
-    ]
+def amd_stats(gpu):
+    try:
+        busy = float(Path(gpu["amd_busy_path"]).read_text().strip())
+    except Exception:
+        return {}
+    result = {"overall": busy}
+    dev = Path(gpu["sys_path"])
+    try:
+        used = float((dev / "mem_info_vram_used").read_text().strip()) / 1024 / 1024
+        total = float((dev / "mem_info_vram_total").read_text().strip()) / 1024 / 1024
+        result.update({
+            "vram_used_mib": used,
+            "vram_total_mib": total,
+            "vram_percent": 0 if total <= 0 else used / total * 100.0,
+        })
+    except Exception:
+        pass
 
-    for selected_index,g in enumerate(selected_gpus,1):
-        vendor=g['vendor']
-        title='GPU METER' if len(selected_gpus)==1 else f'GPU {selected_index} METER'
-        lines += ['',section(title)]
+    temp = gpu_hwmon_temp(gpu)
+    if temp is not None:
+        result["temp"] = temp
+    clock = amd_clock_mhz(gpu)
+    if clock is not None:
+        result["clock_mhz"] = clock
 
-        for name_line in display_name_lines(
-            g['description'],
-            s.get('gpu_name_mode','crop'),
-            s.get('gpu_custom_name',''),
-            width
-        ):
-            lines.append('${color AAAAAA}'+name_line)
+    return result
 
-        base=''
-        if vendor=='intel' and g.get('backend_available'):
-            base=f'python3 {py} --helper-gpu intel --intel-device {shlex.quote(g.get("intel_device",""))}'
-        elif vendor=='nvidia' and g.get('backend_available'):
-            base=f'python3 {py} --helper-gpu nvidia --gpu-id {shlex.quote(g.get("nvidia_uuid",""))}'
-        elif vendor=='amd' and g.get('backend_available'):
-            base=f'python3 {py} --helper-gpu amd --amd-path {shlex.quote(g.get("amd_busy_path",""))}'
 
-        if not base:
-            lines.append('${color AAAAAA}Utilization backend unavailable')
-            continue
+def display_name(text, mode, custom, width):
+    text = (custom if mode == "custom" and custom else text) or ""
+    text = text.replace("$", "").strip()
+    if mode == "crop":
+        chars = max(14, int((width - 12) / 7))
+        return text[:chars]
+    return text
 
-        if vendor=='intel':
-            metrics=[]
-            if s.get('gpu_overall',True): metrics.append(('GPU','overall','C77DFF'))
-            if s.get('gpu_render',True): metrics.append(('Render/3D','render','00FF66'))
-            if s.get('gpu_video',True): metrics.append(('Video/QSV','video','FFD93D'))
-            if s.get('gpu_video_enhance',False): metrics.append(('Video Enhance','videoenhance','00D9FF'))
-            if not metrics: metrics=[('GPU','overall','C77DFF')]
 
-            for label,metric,color in metrics:
-                cmd=base+' --metric '+metric
-                lines.append('${color '+color+'}'+label+' ${alignr}${execi 2 '+cmd+'}%')
-                lines.append('${color '+color+'}${execibar 2 6,0 '+cmd+'}')
-
-            if s['trendlines']:
-                cmd=base+' --metric overall'
-                lines.append('${color C77DFF}${execigraph 2 "'+cmd+'" 28,0 C77DFF C77DFF 100}')
-        else:
-            lines += [
-                '${color C77DFF}GPU ${alignr}${execi 2 '+base+'}%',
-                '${color C77DFF}${execibar 2 7,0 '+base+'}'
-            ]
-
-            if s.get('gpu_vram',True):
-                vram_pct=base+' --metric vram_percent'
-                vram_text=base+' --metric vram_text'
-                lines.append('${color 5DA9FF}VRAM ${alignr}${execi 3 '+vram_text+'}')
-                lines.append('${color 5DA9FF}${execibar 3 6,0 '+vram_pct+'}')
-
-            if s['trendlines']:
-                lines.append('${color C77DFF}${execigraph 2 "'+base+'" 28,0 C77DFF C77DFF 100}')
-
-    if s['show_network']:
-        lines += ['',section('NETWORK'),f'${{color AAAAAA}}Interface ${{alignr}}{iface}',
-                  f'${{color 5DA9FF}}Down ${{alignr}}${{downspeedf {iface}}} KiB/s',
-                  f'${{color FF9F43}}Up   ${{alignr}}${{upspeedf {iface}}} KiB/s']
-        if s['trendlines']:
-            lines.append(f'${{color 5DA9FF}}${{downspeedgraph {iface} 32,0 5DA9FF 5DA9FF}}${{goto 8}}${{color 5DA9FF}}${{upspeedgraph {iface} 32,0 FF9F43 FF9F43}}')
-        lines += [f'${{color AAAAAA}}Total down ${{alignr}}${{totaldown {iface}}}',
-                  f'${{color AAAAAA}}Total up   ${{alignr}}${{totalup {iface}}}']
-
-    if s['show_disk']:
-        lines += ['',section('DISK'),'${color FF5E5E}/ ${alignr}${fs_used /} / ${fs_size /}  ${fs_used_perc /}%','${color FF5E5E}${fs_bar 7,0 /}']
-        if rootdev:
-            lines += [f'${{color 5DA9FF}}Read  ${{alignr}}${{diskio_read {rootdev}}}',
-                      f'${{color FF9F43}}Write ${{alignr}}${{diskio_write {rootdev}}}']
-            if s['trendlines']:
-                lines.append(f'${{color FF5E5E}}${{diskiograph_read {rootdev} 28,0 5DA9FF 5DA9FF}}${{goto 8}}${{color FF5E5E}}${{diskiograph_write {rootdev} 28,0 FF9F43 FF9F43}}')
-
-    interval=max(.5,min(10,float(s['update_interval'])))
-    grid_png=write_grid_png(lines,width,cpu['logical_cpus']) if s['trendlines'] else None
-    text='\n'.join(lines)
-    return f"""conky.config = {{
-    update_interval = {interval},
-    total_run_times = 0,
-    double_buffer = true,
-    no_buffers = true,
-    cpu_avg_samples = 2,
-    net_avg_samples = 2,
-    own_window = true,
-    own_window_type = 'normal',
-    own_window_hints = 'undecorated,below,sticky,skip_taskbar,skip_pager',
-    own_window_transparent = false,
-    own_window_colour = '111111',
-    own_window_argb_visual = true,
-    own_window_argb_value = 225,
-    alignment = '{s['alignment']}',
-    gap_x = {int(s['gap_x'])},
-    gap_y = {int(s['gap_y'])},
-    minimum_width = {width},
-    maximum_width = {width},
-    draw_shades = false,
-    draw_outline = false,
-    draw_borders = true,
-    border_width = 1,
-    border_inner_margin = 8,
-    default_color = 'DDDDDD',
-    font = 'DejaVu Sans Mono:size=8',
-    use_xft = true,
-}};
-conky.text = [[
-${{image {grid_png if grid_png else ""} -p 0,0 -n}}
-{text}
-]];
+CSS = b"""
+window.meter {
+    background: #101010;
+    color: #dddddd;
+}
+.meter-root {
+    padding: 8px;
+}
+.section-title {
+    color: #ffffff;
+    font-weight: 700;
+    font-size: 13px;
+    border-bottom: 1px solid #777777;
+    padding-bottom: 2px;
+}
+.metric-label {
+    font-family: monospace;
+    font-size: 11px;
+}
+.muted {
+    color: #aaaaaa;
+    font-family: monospace;
+    font-size: 11px;
+}
+progressbar {
+    min-width: 0;
+}
+progressbar > trough {
+    background: #222222;
+    min-width: 0;
+    min-height: 6px;
+}
+progressbar > trough > progress {
+    min-width: 0;
+    min-height: 6px;
+}
+progressbar.bar-purple > trough > progress { background-image: none; background-color: #c77dff; }
+progressbar.bar-yellow > trough > progress { background-image: none; background-color: #ffd93d; }
+progressbar.bar-cyan > trough > progress { background-image: none; background-color: #00d9ff; }
+progressbar.bar-red > trough > progress { background-image: none; background-color: #ff5e5e; }
+progressbar.bar-green > trough > progress { background-image: none; background-color: #00ff66; }
+progressbar.bar-blue > trough > progress { background-image: none; background-color: #5da9ff; }
+progressbar.bar-lime > trough > progress { background-image: none; background-color: #b8f34a; }
+progressbar.bar-orange > trough > progress { background-image: none; background-color: #ff9f43; }
 """
 
 
-def stop_meter(): subprocess.run(['pkill','-f','conky.*allcpumeter-linux.conf'],check=False)
-def start_meter():
-    stop_meter()
-    subprocess.Popen(['conky','-c',str(CONKY_FILE)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
 
-def write_config(hw,s):
-    CONKY_DIR.mkdir(parents=True,exist_ok=True); CONKY_FILE.write_text(generate_conky(hw,s)); save_settings(s)
-    AUTOSTART_DIR.mkdir(parents=True,exist_ok=True)
-    if s['autostart']:
-        AUTOSTART_FILE.write_text(f"""[Desktop Entry]\nType=Application\nName=All CPU Meter\nExec=sh -c 'sleep 3; conky -c {CONKY_FILE}'\nTerminal=false\nX-GNOME-Autostart-enabled=true\n""")
-    else: AUTOSTART_FILE.unlink(missing_ok=True)
+def _png_chunk(kind, data):
+    return (
+        struct.pack(">I", len(data))
+        + kind
+        + data
+        + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+    )
 
 
-def launch_gui():
-    import tkinter as tk
-    from tkinter import ttk,messagebox
+class TrendGraph(Gtk.Picture):
+    """History graph rendered to a tiny PNG for maximum GTK/RDP compatibility."""
+    _serial = 0
 
-    class App(tk.Tk):
-        def __init__(self):
-            super().__init__(); self.title('All CPU Meter for Linux'); self.geometry('780x780'); self.minsize(720,680)
-            self.hw={}; self.settings=load_settings(); self.vars={}; self.gpu_vars={}; self.build(); self.refresh()
-        def v(self,name,default,kind='bool'):
-            val=self.settings.get(name,default)
-            cls={'bool':tk.BooleanVar,'str':tk.StringVar,'int':tk.IntVar,'float':tk.DoubleVar}[kind]
-            var=cls(value=val); self.vars[name]=var; return var
-        def build(self):
-            outer=ttk.Frame(self,padding=12); outer.pack(fill='both',expand=True)
-            ttk.Label(outer,text='All CPU Meter for Linux',font=('',16,'bold')).pack(anchor='w')
-            ttk.Label(outer,text='Detect hardware, choose the detail you want, then generate and start the desktop meter.').pack(anchor='w',pady=(2,10))
-            nb=ttk.Notebook(outer); nb.pack(fill='both',expand=True)
-            self.tab_hw=ttk.Frame(nb,padding=12); self.tab_display=ttk.Frame(nb,padding=12); self.tab_style=ttk.Frame(nb,padding=12)
-            nb.add(self.tab_hw,text='Hardware'); nb.add(self.tab_display,text='Display'); nb.add(self.tab_style,text='Style')
-            self.hw_text=tk.Text(self.tab_hw,height=18,wrap='word'); self.hw_text.pack(fill='both',expand=True)
-            ttk.Button(self.tab_hw,text='Rescan Hardware',command=self.refresh).pack(anchor='w',pady=(8,0))
-            self.dep=ttk.LabelFrame(self.tab_hw,text='Optional Dependencies',padding=8); self.dep.pack(fill='x',pady=(10,0))
-            self.build_display(); self.build_style()
-            b=ttk.Frame(outer); b.pack(fill='x',pady=(10,0)); ttk.Button(b,text='Stop Meter',command=self.stop).pack(side='left'); ttk.Button(b,text='Apply and Start Meter',command=self.apply).pack(side='right')
-        def build_display(self):
-            f=ttk.LabelFrame(self.tab_display,text='Preset',padding=8); f.pack(fill='x'); pv=self.v('preset','detailed','str')
-            for label,value in [('Basic','basic'),('Detailed','detailed'),('Custom','custom')]: ttk.Radiobutton(f,text=label,value=value,variable=pv,command=self.preset).pack(side='left',padx=(0,16))
+    def __init__(self, traces=1, colors=None, height=30, width=160):
+        super().__init__()
+        TrendGraph._serial += 1
+        self.graph_id = TrendGraph._serial
+        self.histories = [deque(maxlen=120) for _ in range(traces)]
+        self.colors = colors or ["#57c7ff"] * traces
+        self.graph_width = max(80, int(width))
+        self.graph_height = max(18, int(height))
+        self.frame_no = 0
 
-            f=ttk.LabelFrame(self.tab_display,text='Hardware names',padding=8); f.pack(fill='x',pady=(10,0))
-            for row,(title,prefix) in enumerate([('CPU','cpu'),('GPU','gpu')]):
-                ttk.Label(f,text=title,width=5).grid(row=row,column=0,sticky='w',pady=3)
-                mode=self.v(prefix+'_name_mode','crop','str')
-                for col,(label,value) in enumerate([('Crop','crop'),('Wrap','wrap'),('Custom','custom')],1):
-                    ttk.Radiobutton(f,text=label,value=value,variable=mode).grid(row=row,column=col,sticky='w',padx=(0,6))
-                ttk.Entry(f,textvariable=self.v(prefix+'_custom_name','','str'),width=31).grid(row=row,column=4,sticky='ew',padx=(8,0))
-            f.columnconfigure(4,weight=1)
+        cache = Path.home() / ".cache" / "allcpumeter-linux" / "graphs"
+        cache.mkdir(parents=True, exist_ok=True)
+        self.cache_dir = cache
 
-            f=ttk.LabelFrame(self.tab_display,text='CPU',padding=8); f.pack(fill='x',pady=(10,0))
-            ttk.Checkbutton(f,text='Show each logical CPU',variable=self.v('per_core',True)).pack(anchor='w'); ttk.Checkbutton(f,text='Show CPU frequency',variable=self.v('show_freq',True)).pack(anchor='w')
-            tv=self.v('temp_mode','package','str'); ttk.Label(f,text='Temperature detail:').pack(anchor='w',pady=(6,0))
-            for label,value in [('Package / whole-chip temperature','package'),('Per-core temperatures when available','cores'),('Do not show CPU temperature','off')]: ttk.Radiobutton(f,text=label,value=value,variable=tv).pack(anchor='w')
+        self.set_size_request(self.graph_width, self.graph_height)
+        self.set_hexpand(False)
+        self.set_vexpand(False)
+        self.set_can_shrink(False)
+        self._render()
 
-            f=ttk.LabelFrame(self.tab_display,text='Memory and Devices',padding=8); f.pack(fill='x',pady=(10,0))
-            for name,label,default in [('show_swap','Show swap',True),('show_network','Show network',True),('show_disk','Show root disk',True)]:
-                ttk.Checkbutton(f,text=label,variable=self.v(name,default)).pack(anchor='w')
+    @staticmethod
+    def rgb(hexcolor):
+        c = hexcolor.lstrip("#")
+        return tuple(int(c[i:i+2], 16) for i in (0, 2, 4))
 
-            self.gpu_select=ttk.LabelFrame(self.tab_display,text='Detected GPUs',padding=8)
-            self.gpu_select.pack(fill='x',pady=(10,0))
-            ttk.Label(self.gpu_select,text='Choose which detected adapters should appear in the meter. Unsupported adapters are off by default.').pack(anchor='w')
-
-            f=ttk.LabelFrame(self.tab_display,text='Intel GPU details',padding=8); f.pack(fill='x',pady=(10,0))
-            ttk.Label(f,text='For Intel GPUs, choose the engine utilization rows to display. Video/QSV is the hardware video engine used by Quick Sync.').pack(anchor='w')
-            row=ttk.Frame(f); row.pack(fill='x',pady=(4,0))
-            for name,label,default in [('gpu_overall','Overall (busiest engine)',True),('gpu_render','Render/3D',True),('gpu_video','Video/QSV',True),('gpu_video_enhance','Video Enhance',False)]:
-                ttk.Checkbutton(row,text=label,variable=self.v(name,default)).pack(side='left',padx=(0,12))
-
-        def build_style(self):
-            f=ttk.LabelFrame(self.tab_style,text='Appearance',padding=8); f.pack(fill='x')
-            ttk.Checkbutton(f,text='Classic multicolor per-CPU bars',variable=self.v('multicolor',True)).pack(anchor='w'); ttk.Checkbutton(f,text='Show trend graphs',variable=self.v('trendlines',True)).pack(anchor='w'); ttk.Checkbutton(f,text='Start meter automatically when I log in',variable=self.v('autostart',True)).pack(anchor='w')
-            f=ttk.LabelFrame(self.tab_style,text='Position and Size',padding=8); f.pack(fill='x',pady=(10,0))
-            rows=[('Position','alignment','top_right','str'),('Width (pixels)','width',180,'int'),('Horizontal gap','gap_x',12,'int'),('Vertical gap','gap_y',40,'int'),('Refresh interval (seconds)','update_interval',1.0,'float')]
-            for r,(label,name,default,kind) in enumerate(rows):
-                ttk.Label(f,text=label).grid(row=r,column=0,sticky='w',pady=4)
-                if name=='alignment': ttk.Combobox(f,textvariable=self.v(name,default,kind),values=['top_right','top_left','bottom_right','bottom_left'],state='readonly',width=18).grid(row=r,column=1,sticky='w',padx=8)
-                else:
-                    minimum=150 if name=='width' else (.5 if kind=='float' else 0)
-                    ttk.Spinbox(f,from_=minimum,to=500,increment=.5 if kind=='float' else 1,textvariable=self.v(name,default,kind),width=8).grid(row=r,column=1,sticky='w',padx=8)
-        def refresh(self):
-            old_gpu_values={k:v.get() for k,v in self.gpu_vars.items()}
-
-            self.config(cursor='watch')
-            self.update_idletasks()
-            self.hw=scan()
-
-            # Probe each Intel adapter independently when possible.
-            for gpu in self.hw.get('gpus',[]):
-                if gpu.get('vendor')=='intel' and gpu.get('backend_available'):
-                    probe=intel_gpu_probe(gpu.get('intel_device',''))
-                    gpu['intel_probe']=probe
-                    gpu['backend_available']=bool(probe.get('usable'))
-                    if not gpu['backend_available']:
-                        gpu['backend_label']=probe.get('error') or 'Intel counters unavailable'
-
-            self.config(cursor='')
-            self.render_gpu_selection(old_gpu_values)
-
-            h=self.hw
-            lines=[
-                f"CPU: {h['cpu']['model']}",
-                f"Logical CPUs: {h['cpu']['logical_cpus']}",
-                '',
-                f"Primary network interface: {h['network']['primary']}",
-                f"Root disk device: {h['disk']['root_device'] or 'not determined'}",
-                ''
-            ]
-
-            if h['gpus']:
-                for i,g in enumerate(h['gpus'],1):
-                    status=g.get('backend_label','')
-                    lines.append(
-                        f"GPU {i}: {g['vendor'].upper()} - {g['description']} "
-                        f"[{g.get('bdf','unknown PCI')}; {status}]"
-                    )
-            else:
-                lines.append('GPU: none detected by lspci')
-
-            lines += [
-                '',
-                'lm-sensors: '+(
-                    'available' if h['sensors']['usable']
-                    else 'installed but no readable temperatures' if h['sensors']['installed']
-                    else 'not installed'
-                )
-            ]
-            if h['sensors']['usable']:
-                lines.append(f"Per-core temperature labels found: {h['sensors']['core_temps']}")
-
-            self.hw_text.delete('1.0','end')
-            self.hw_text.insert('1.0','\n'.join(lines))
-            self.render_deps()
-
-        def render_gpu_selection(self,old_values=None):
-            old_values=old_values or {}
-            saved=self.settings.get('gpu_enabled',{})
-            for w in self.gpu_select.winfo_children()[1:]:
-                w.destroy()
-
-            self.gpu_vars={}
-            for i,g in enumerate(self.hw.get('gpus',[]),1):
-                key=g.get('key') or f'gpu-{i}'
-                default=bool(g.get('backend_available'))
-                value=old_values.get(key,saved.get(key,default))
-                var=tk.BooleanVar(value=value)
-                self.gpu_vars[key]=var
-
-                suffix=g.get('backend_label','')
-                label=f"GPU {i}: {g.get('description','Unknown GPU')}"
-                if suffix:
-                    label += f"  [{suffix}]"
-                ttk.Checkbutton(self.gpu_select,text=label,variable=var).pack(anchor='w',pady=(3,0))
-
-            if not self.hw.get('gpus'):
-                ttk.Label(self.gpu_select,text='No GPUs detected.').pack(anchor='w',pady=(4,0))
-
-        def render_deps(self):
-            for w in self.dep.winfo_children():
-                w.destroy()
-            row=0
-
-            def dep_line(label,package=None):
-                nonlocal row
-                ttk.Label(self.dep,text=label).grid(row=row,column=0,sticky='w')
-                if package:
-                    ttk.Button(
-                        self.dep,text='Install',
-                        command=lambda p=package:self.install_pkg(p)
-                    ).grid(row=row,column=1,padx=8)
-                row+=1
-
-            dep_line(
-                'CPU temperatures (lm-sensors): '+(
-                    'Installed' if self.hw['sensors']['installed'] else 'Not installed'
-                ),
-                None if self.hw['sensors']['installed'] else 'lm-sensors'
-            )
-
-            vendors={g['vendor'] for g in self.hw.get('gpus',[])}
-
-            if 'intel' in vendors:
-                if not shutil.which('intel_gpu_top'):
-                    dep_line('Intel GPU utilization (intel-gpu-tools): Not installed','intel-gpu-tools')
-                else:
-                    usable=any(
-                        g.get('vendor')=='intel' and g.get('backend_available')
-                        for g in self.hw.get('gpus',[])
-                    )
-                    dep_line('Intel GPU utilization: '+('Available' if usable else 'installed, but counters are not readable'))
-
-            if 'nvidia' in vendors:
-                usable=any(
-                    g.get('vendor')=='nvidia' and g.get('backend_available')
-                    for g in self.hw.get('gpus',[])
-                )
-                dep_line('NVIDIA GPU utility (nvidia-smi): '+('Available' if usable else 'installed/driver counters unavailable'))
-
-            if 'amd' in vendors:
-                usable=any(
-                    g.get('vendor')=='amd' and g.get('backend_available')
-                    for g in self.hw.get('gpus',[])
-                )
-                dep_line('AMD kernel utilization counter: '+('Available' if usable else 'Not exposed'))
-        def install_pkg(self,pkg):
+    def push(self, *values):
+        for hist, value in zip(self.histories, values):
             try:
-                rc=subprocess.run(['pkexec','apt-get','install','-y',pkg],check=False).returncode
-                if rc==0: messagebox.showinfo('Installed',f'{pkg} was installed successfully.'); self.refresh()
-                else: messagebox.showerror('Install failed',f'Ubuntu returned exit code {rc}.')
-            except Exception as e: messagebox.showerror('Install failed',str(e))
-        def preset(self):
-            p=self.vars['preset'].get()
-            vals={'basic':dict(per_core=False,temp_mode='package',show_freq=False,show_swap=False,show_disk=True,show_network=True,trendlines=False,gpu_overall=True,gpu_render=False,gpu_video=False,gpu_video_enhance=False),'detailed':dict(per_core=True,temp_mode='package',show_freq=True,show_swap=True,show_disk=True,show_network=True,trendlines=True,gpu_overall=True,gpu_render=True,gpu_video=True,gpu_video_enhance=False)}.get(p)
-            if vals:
-                for k,v in vals.items(): self.vars[k].set(v)
-        def collect(self):
-            out={k:v.get() for k,v in self.vars.items()}
-            out['gpu_enabled']={k:v.get() for k,v in self.gpu_vars.items()}
-            out['settings_version']=SETTINGS_SCHEMA_VERSION
-            return out
-        def apply(self):
-            try: write_config(self.hw,self.collect()); start_meter(); messagebox.showinfo('Meter started',f'The meter is running.\n\nConfiguration:\n{CONKY_FILE}')
-            except Exception as e: messagebox.showerror('Could not start meter',str(e))
-        def stop(self): stop_meter(); messagebox.showinfo('Meter stopped','The All CPU Meter Conky process was stopped.')
-    App().mainloop()
+                value = float(value)
+            except Exception:
+                value = 0.0
+            hist.append(max(0.0, min(100.0, value)))
+        self._render()
+
+    def _render(self):
+        w, h = self.graph_width, self.graph_height
+        pixels = [bytearray(w * 4) for _ in range(h)]
+
+        def put(x, y, rgba):
+            if 0 <= x < w and 0 <= y < h:
+                i = x * 4
+                pixels[y][i:i+4] = bytes(rgba)
+
+        def hline(y, x1, x2, rgba):
+            for x in range(max(0, x1), min(w, x2 + 1)):
+                put(x, y, rgba)
+
+        def vline(x, y1, y2, rgba):
+            for y in range(max(0, y1), min(h, y2 + 1)):
+                put(x, y, rgba)
+
+        def line(x0, y0, x1, y1, rgba, thickness=1):
+            dx = abs(x1 - x0)
+            sx = 1 if x0 < x1 else -1
+            dy = -abs(y1 - y0)
+            sy = 1 if y0 < y1 else -1
+            err = dx + dy
+            while True:
+                radius = max(0, thickness // 2)
+                for yy in range(y0 - radius, y0 + radius + 1):
+                    for xx in range(x0 - radius, x0 + radius + 1):
+                        put(xx, yy, rgba)
+                if x0 == x1 and y0 == y1:
+                    break
+                e2 = 2 * err
+                if e2 >= dy:
+                    err += dy
+                    x0 += sx
+                if e2 <= dx:
+                    err += dx
+                    y0 += sy
+
+        # Opaque dark face.
+        for y in range(h):
+            for x in range(w):
+                put(x, y, (8, 8, 8, 255))
+
+        # Muted gray background grid.
+        grid = (78, 78, 78, 255)
+        for i in range(1, 6):
+            x = round((w - 1) * i / 6)
+            vline(x, 1, h - 2, grid)
+        for i in range(1, 4):
+            y = round((h - 1) * i / 4)
+            hline(y, 1, w - 2, grid)
+
+        # Border.
+        border = (135, 135, 135, 255)
+        hline(0, 0, w - 1, border)
+        hline(h - 1, 0, w - 1, border)
+        vline(0, 0, h - 1, border)
+        vline(w - 1, 0, h - 1, border)
+
+        def py(value):
+            return int(round((h - 3) - (value / 100.0) * max(1, h - 5)))
+
+        for hist, color in zip(self.histories, self.colors):
+            if not hist:
+                continue
+            r, g, b = self.rgb(color)
+            rgba = (r, g, b, 255)
+            values = list(hist)
+            n = len(values)
+
+            # History grows from right to left and fills the available graph
+            # width when the 120-sample buffer is full.
+            step = (w - 5) / 119.0
+            x_end = w - 3
+            x_start = max(2.0, x_end - step * (n - 1))
+
+            if n == 1:
+                y = py(values[0])
+                line(max(2, x_end - 3), y, x_end, y, rgba, 1)
+            else:
+                prev_x = int(round(x_start))
+                prev_y = py(values[0])
+                for i, value in enumerate(values[1:], 1):
+                    x = min(x_end, int(round(x_start + i * step)))
+                    y = py(value)
+                    line(prev_x, prev_y, x, y, rgba, 1)
+                    prev_x, prev_y = x, y
+
+            # Current value is just the final pixel of the thin trace.
+            cy = py(values[-1])
+            put(x_end, cy, rgba)
+
+        raw = b"".join(b"\x00" + bytes(row) for row in pixels)
+        png = (
+            b"\x89PNG\r\n\x1a\n"
+            + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + _png_chunk(b"IDAT", zlib.compress(raw, 6))
+            + _png_chunk(b"IEND", b"")
+        )
+
+        self.frame_no += 1
+        path = self.cache_dir / f"graph-{os.getpid()}-{self.graph_id}-{self.frame_no % 2}.png"
+        path.write_bytes(png)
+
+        try:
+            texture = Gdk.Texture.new_from_filename(str(path))
+            self.set_paintable(texture)
+        except Exception:
+            self.set_filename(str(path))
+
+
+BAR_CLASSES = {
+    "#c77dff": "bar-purple",
+    "#ffd93d": "bar-yellow",
+    "#00d9ff": "bar-cyan",
+    "#ff5e5e": "bar-red",
+    "#00ff66": "bar-green",
+    "#5da9ff": "bar-blue",
+    "#b8f34a": "bar-lime",
+    "#ff9f43": "bar-orange",
+}
+
+
+def progress(color):
+    bar = Gtk.ProgressBar()
+    bar.set_show_text(False)
+    bar.set_size_request(8, -1)
+    bar.set_hexpand(True)
+    bar.add_css_class(BAR_CLASSES.get(color.lower(), "bar-blue"))
+    return bar
+
+
+
+class MeterWindow(Gtk.ApplicationWindow):
+    def __init__(self, app, settings, hardware):
+        super().__init__(application=app, title="All CPU Meter")
+        self.settings = settings
+        self.hardware = hardware
+        self.panel_width = max(150, int(settings["width"]))
+        panel_width = max(150, int(settings["width"]))
+        self.set_default_size(panel_width, -1)
+        self.set_size_request(panel_width, -1)
+        self.set_resizable(False)
+        self.set_decorated(False)
+        self.set_focusable(False)
+        self.set_modal(False)
+        self.add_css_class("meter")
+        self.connect("realize", self._apply_widget_window_hints)
+
+        # Without a GNOME Shell placement helper, Wayland applications cannot
+        # choose absolute coordinates. Keep the undecorated meter draggable as
+        # a fallback instead of making an accidentally misplaced meter immovable.
+        drag = Gtk.GestureClick()
+        drag.set_button(1)
+        drag.connect("pressed", self._begin_window_move)
+        self.add_controller(drag)
+
+        self.prev_cpu = read_proc_stat()
+        self.prev_net = net_bytes(hardware["network"]["primary"])
+        self.prev_disk = disk_stats(hardware["disk"]["root_device"])
+        self.prev_time = time.monotonic()
+
+        self.cpu_rows = []
+        self.gpu_rows = []
+        self.core_ids = logical_core_ids()
+        self.physical_groups = physical_core_groups()
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        outer.add_css_class("meter-root")
+        self.set_child(outer)
+        self.outer = outer
+        self.build_ui()
+
+        interval_ms = max(250, int(float(settings["update_interval"]) * 1000))
+        self.refresh()
+        GLib.timeout_add(interval_ms, self.refresh)
+
+    def _apply_widget_window_hints(self, *_args):
+        try:
+            surface = self.get_surface()
+            if surface is not None:
+                surface.set_urgency_hint(False)
+        except Exception:
+            pass
+
+    def _begin_window_move(self, gesture, n_press, x, y):
+        try:
+            event = gesture.get_current_event()
+            surface = self.get_surface()
+            if event is None or surface is None:
+                return
+            device = event.get_device()
+            timestamp = event.get_time()
+            surface.begin_move(device, 1, x, y, timestamp)
+        except Exception:
+            pass
+
+
+    def title(self, text):
+        label = Gtk.Label(label=text, xalign=0)
+        label.add_css_class("section-title")
+        self.outer.append(label)
+
+    def row_label(self, text="", css="metric-label"):
+        label = Gtk.Label(label=text, xalign=0)
+        label.add_css_class(css)
+        label.set_wrap(False)
+        label.set_hexpand(True)
+        label.set_width_chars(1)
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+        return label
+
+    def metric_pair(self, left="", right="", css="metric-label"):
+        """Compact left/right metric row that uses the full panel width."""
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+
+        left_label = Gtk.Label(label=left, xalign=0)
+        left_label.add_css_class(css)
+        left_label.set_hexpand(False)
+        left_label.set_ellipsize(Pango.EllipsizeMode.END)
+        left_label.set_width_chars(1)
+
+        right_label = Gtk.Label(label=right, xalign=1)
+        right_label.add_css_class(css)
+        right_label.set_hexpand(True)
+        right_label.set_halign(Gtk.Align.FILL)
+        right_label.set_ellipsize(Pango.EllipsizeMode.NONE)
+
+        row.append(left_label)
+        row.append(right_label)
+        return row, left_label, right_label
+
+    def build_ui(self):
+        s = self.settings
+        cpu = self.hardware["cpu"]
+        self.title("CPU METER")
+        name = self.row_label(display_name(
+            cpu["model"], s["cpu_name_mode"], s["cpu_custom_name"], s["width"]
+        ), "muted")
+        if s["cpu_name_mode"] == "wrap":
+            name.set_ellipsize(Pango.EllipsizeMode.NONE)
+            name.set_wrap(True)
+            name.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.outer.append(name)
+
+        self.cpu_total_label = self.row_label()
+        self.cpu_total_bar = progress("#00ff66")
+        self.outer.append(self.cpu_total_label)
+        self.outer.append(self.cpu_total_bar)
+
+        self.freq_label = None
+        if s["show_freq"]:
+            row, _, self.freq_label = self.metric_pair("Frequency", "", "muted")
+            self.outer.append(row)
+
+        self.package_temp_label = None
+        if s["temp_mode"] == "package":
+            row, _, self.package_temp_label = self.metric_pair("Temperature", "", "muted")
+            self.outer.append(row)
+
+        detail = s.get("cpu_detail", "logical")
+        if not s.get("per_core", True):
+            detail = "overall"
+
+        row_specs = []
+        if detail == "logical":
+            for i in range(cpu["logical_cpus"]):
+                row_specs.append({
+                    "label": f"CPU {i+1:02d}",
+                    "logicals": [i],
+                    "core_id": self.core_ids[i] if i < len(self.core_ids) else i,
+                })
+        elif detail == "physical":
+            multi_package = len({g["package"] for g in self.physical_groups}) > 1
+            for i, group in enumerate(self.physical_groups, 1):
+                label_text = (
+                    f"P{group['package']} C{i:02d}"
+                    if multi_package else f"Core {i:02d}"
+                )
+                row_specs.append({
+                    "label": label_text,
+                    "logicals": group["logicals"],
+                    "core_id": group["core_id"],
+                })
+
+        for i, spec in enumerate(row_specs):
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+            label = self.row_label(spec["label"])
+            label.set_size_request(38, -1)
+            label.set_hexpand(False)
+            color = PALETTE[i % len(PALETTE)] if s["multicolor"] else "#5da9ff"
+            bar = progress(color)
+            bar.set_hexpand(True)
+            right = self.row_label("")
+            # Percentage-only mode needs very little space. Per-core temperature
+            # mode gets a wider value field for strings such as "42°C 100%".
+            right_width = 29 if s.get("temp_mode") != "cores" else 55
+            right.set_size_request(right_width, -1)
+            right.set_hexpand(False)
+            right.set_xalign(1)
+            row.append(label); row.append(bar); row.append(right)
+            self.outer.append(row)
+            self.cpu_rows.append({
+                "bar": bar,
+                "right": right,
+                "logicals": spec["logicals"],
+                "core_id": spec["core_id"],
+            })
+
+        self.cpu_graph = None
+        if s["trendlines"]:
+            self.cpu_graph = TrendGraph(1, ["#00ff66"], 34, max(80, self.panel_width - 16))
+            self.outer.append(self.cpu_graph)
+
+        self.title("MEMORY")
+        ram_row, _, self.ram_label = self.metric_pair("RAM", "")
+        self.ram_bar = progress("#5da9ff")
+        self.outer.append(ram_row); self.outer.append(self.ram_bar)
+
+        self.swap_label = None
+        self.swap_bar = None
+        if s["show_swap"]:
+            swap_row, _, self.swap_label = self.metric_pair("Swap", "")
+            self.swap_bar = progress("#ffd93d")
+            self.outer.append(swap_row); self.outer.append(self.swap_bar)
+
+        self.mem_graph = None
+        if s["trendlines"]:
+            self.mem_graph = TrendGraph(1, ["#5da9ff"], 28, max(80, self.panel_width - 16))
+            self.outer.append(self.mem_graph)
+
+        enabled = s.get("gpu_enabled", {})
+        selected = [
+            g for g in self.hardware["gpus"]
+            if enabled.get(g["key"], g.get("backend_available", False))
+        ]
+        for idx, gpu in enumerate(selected, 1):
+            self.title("GPU METER" if len(selected) == 1 else f"GPU {idx} METER")
+            gpu_name_settings = s.get("gpu_names", {}).get(gpu["key"], {})
+            gpu_name_mode = gpu_name_settings.get(
+                "mode", s.get("gpu_name_mode", "crop")
+            )
+            gpu_custom_name = gpu_name_settings.get(
+                "custom", s.get("gpu_custom_name", "")
+            )
+            name = self.row_label(display_name(
+                gpu["description"], gpu_name_mode, gpu_custom_name, s["width"]
+            ), "muted")
+            if gpu_name_mode == "wrap":
+                name.set_ellipsize(Pango.EllipsizeMode.NONE)
+                name.set_wrap(True)
+                name.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            self.outer.append(name)
+
+            metric_rows = []
+            if gpu["vendor"] == "intel":
+                metrics = []
+                if s["gpu_overall"]: metrics.append(("GPU","overall","#c77dff"))
+                if s["gpu_render"]: metrics.append(("Render/3D","render","#00ff66"))
+                if s["gpu_video"]: metrics.append(("Video/QSV","video","#ffd93d"))
+                if s["gpu_video_enhance"]: metrics.append(("Video Enhance","videoenhance","#00d9ff"))
+            else:
+                metrics = [("GPU","overall","#c77dff")]
+
+            for label_text, metric, color in metrics:
+                metric_row, _, label = self.metric_pair(label_text, "")
+                bar = progress(color)
+                self.outer.append(metric_row); self.outer.append(bar)
+                metric_rows.append((metric, label_text, label, bar))
+
+            vram_label = vram_bar = None
+            if s["gpu_vram"] and gpu["vendor"] in ("nvidia","amd"):
+                vram_row, _, vram_label = self.metric_pair("VRAM", "")
+                vram_bar = progress("#5da9ff")
+                self.outer.append(vram_row); self.outer.append(vram_bar)
+
+            status_row, self.gpu_temp_label, self.gpu_clock_label = self.metric_pair("", "", "muted")
+            self.outer.append(status_row)
+
+            graph = None
+            if s["trendlines"]:
+                graph = TrendGraph(1, ["#c77dff"], 28, max(80, self.panel_width - 16))
+                self.outer.append(graph)
+
+            self.gpu_rows.append({
+                "gpu": gpu, "metrics": metric_rows,
+                "vram_label": vram_label, "vram_bar": vram_bar,
+                "temp_label": self.gpu_temp_label,
+                "clock_label": self.gpu_clock_label,
+                "graph": graph
+            })
+
+        if s["show_network"]:
+            self.title("NETWORK")
+            row, _, self.net_iface = self.metric_pair("Interface", "", "muted")
+            self.outer.append(row)
+            row, _, self.net_down = self.metric_pair("Down", "")
+            self.outer.append(row)
+            row, _, self.net_up = self.metric_pair("Up", "")
+            self.outer.append(row)
+            self.net_graph = TrendGraph(2, ["#5da9ff","#ff9f43"], 32, max(80, self.panel_width - 16)) if s["trendlines"] else None
+            if self.net_graph: self.outer.append(self.net_graph)
+        else:
+            self.net_graph = None
+
+        if s["show_disk"]:
+            self.title("DISK")
+            row, self.disk_path_label, self.disk_usage = self.metric_pair("/", "")
+            self.outer.append(row)
+            self.disk_bar = progress("#ff5e5e")
+            self.outer.append(self.disk_bar)
+            row, _, self.disk_read = self.metric_pair("Read", "")
+            self.outer.append(row)
+            row, _, self.disk_write = self.metric_pair("Write", "")
+            self.outer.append(row)
+            self.disk_graph = TrendGraph(2, ["#5da9ff","#ff9f43"], 28, max(80, self.panel_width - 16)) if s["trendlines"] else None
+            if self.disk_graph: self.outer.append(self.disk_graph)
+        else:
+            self.disk_graph = None
+
+    def gpu_stats(self, gpu):
+        if gpu["vendor"] == "nvidia":
+            return nvidia_stats(gpu.get("nvidia_uuid",""))
+        if gpu["vendor"] == "amd":
+            return amd_stats(gpu)
+        if gpu["vendor"] == "intel":
+            stats = intel_gpu_stats(gpu.get("intel_device",""))
+            temp = gpu_hwmon_temp(gpu)
+            clock = intel_clock_mhz(gpu)
+            if temp is not None:
+                stats["temp"] = temp
+            if clock is not None:
+                stats["clock_mhz"] = clock
+            return stats
+        return {}
+
+    def refresh(self):
+        now = time.monotonic()
+        elapsed = max(0.001, now - self.prev_time)
+
+        cur_cpu = read_proc_stat()
+        overall = cpu_usage(self.prev_cpu[0], cur_cpu[0])
+        self.cpu_total_label.set_markup(f'<span foreground="#00ff66">CPU</span> {overall:.0f}%')
+        self.cpu_total_bar.set_fraction(overall / 100.0)
+        if self.cpu_graph:
+            self.cpu_graph.push(overall)
+
+        if self.settings["show_freq"]:
+            self.freq_label.set_text(f"{cpu_frequency_ghz():.2f} GHz")
+
+        items = read_sensor_items() if self.hardware["sensors_installed"] else []
+        package = package_temp(items)
+        cores_temp = per_core_temps(items)
+
+        if self.settings["temp_mode"] == "package":
+            self.package_temp_label.set_text("N/A" if package is None else f"{package:.0f}°C")
+
+        prev_cores = self.prev_cpu[1]
+        cur_cores = cur_cpu[1]
+        for row in self.cpu_rows:
+            values = []
+            for logical in row["logicals"]:
+                values.append(cpu_usage(
+                    prev_cores[logical] if logical < len(prev_cores) else None,
+                    cur_cores[logical] if logical < len(cur_cores) else None,
+                ))
+            usage = sum(values) / len(values) if values else 0.0
+            row["bar"].set_fraction(usage / 100.0)
+            if self.settings["temp_mode"] == "cores":
+                temp = cores_temp.get(row["core_id"])
+                row["right"].set_text(
+                    f"{'--' if temp is None else f'{temp:.0f}°C'} {usage:.0f}%"
+                )
+            else:
+                row["right"].set_text(f"{usage:.0f}%")
+
+        mem = mem_stats()
+        self.ram_label.set_text(f"{format_bytes(mem['used'])} / {format_bytes(mem['total'])}  {mem['percent']:.0f}%")
+        self.ram_bar.set_fraction(mem["percent"] / 100.0)
+        if self.mem_graph:
+            self.mem_graph.push(mem["percent"])
+        if self.swap_label:
+            self.swap_label.set_text(f"{format_bytes(mem['swap_used'])} / {format_bytes(mem['swap_total'])}  {mem['swap_percent']:.0f}%")
+            self.swap_bar.set_fraction(mem["swap_percent"] / 100.0)
+
+        for row in self.gpu_rows:
+            stats = self.gpu_stats(row["gpu"])
+            for metric, label_text, label, bar in row["metrics"]:
+                value = float(stats.get(metric, 0.0) or 0.0)
+                label.set_text(f"{value:.0f}%")
+                bar.set_fraction(max(0.0, min(1.0, value / 100.0)))
+            if row["vram_label"]:
+                used = stats.get("vram_used_mib")
+                total = stats.get("vram_total_mib")
+                pct = float(stats.get("vram_percent", 0.0) or 0.0)
+                if used is None or total is None:
+                    row["vram_label"].set_text("N/A")
+                else:
+                    row["vram_label"].set_text(f"{used/1024:.2f} / {total/1024:.2f} GiB  {pct:.0f}%")
+                row["vram_bar"].set_fraction(max(0.0, min(1.0, pct / 100.0)))
+            temp = stats.get("temp")
+            clock = stats.get("clock_mhz")
+            row["temp_label"].set_text("" if temp is None else f"Temp {float(temp):.0f}°C")
+            row["clock_label"].set_text("" if clock is None else f"Clock {float(clock):.0f} MHz")
+
+            if row["graph"]:
+                row["graph"].push(float(stats.get("overall",0.0) or 0.0))
+
+        if self.settings["show_network"]:
+            iface = self.hardware["network"]["primary"]
+            cur_net = net_bytes(iface)
+            down = max(0, cur_net[0] - self.prev_net[0]) / elapsed
+            up = max(0, cur_net[1] - self.prev_net[1]) / elapsed
+            self.net_iface.set_text(iface)
+            self.net_down.set_markup(f'<span foreground="#5da9ff">{format_bytes(down)}/s</span>')
+            self.net_up.set_markup(f'<span foreground="#ff9f43">{format_bytes(up)}/s</span>')
+            if self.net_graph:
+                # Relative autoscale would be more diagnostic; for now use 100 MiB/s full scale.
+                self.net_graph.push(min(100, down / (100*1024*1024) * 100),
+                                    min(100, up / (100*1024*1024) * 100))
+            self.prev_net = cur_net
+
+        if self.settings["show_disk"]:
+            used, total, pct = root_fs_stats()
+            self.disk_usage.set_text(f"{format_bytes(used)} / {format_bytes(total)}  {pct:.0f}%")
+            self.disk_bar.set_fraction(pct / 100.0)
+            cur_disk = disk_stats(self.hardware["disk"]["root_device"])
+            rd = max(0, cur_disk[0] - self.prev_disk[0]) / elapsed
+            wr = max(0, cur_disk[1] - self.prev_disk[1]) / elapsed
+            self.disk_read.set_markup(f'<span foreground="#5da9ff">{format_bytes(rd)}/s</span>')
+            self.disk_write.set_markup(f'<span foreground="#ff9f43">{format_bytes(wr)}/s</span>')
+            if self.disk_graph:
+                self.disk_graph.push(min(100, rd / (500*1024*1024) * 100),
+                                     min(100, wr / (500*1024*1024) * 100))
+            self.prev_disk = cur_disk
+
+        self.prev_cpu = cur_cpu
+        self.prev_time = now
+        return True
+
+
+class ConfigWindow(Gtk.ApplicationWindow):
+    def __init__(self, app, settings, hardware):
+        super().__init__(application=app, title=f"All CPU Meter for Linux v{APP_VERSION}")
+        self.settings = settings
+        self.hardware = hardware
+        self.set_default_size(760, 680)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        root.set_margin_top(12); root.set_margin_bottom(12)
+        root.set_margin_start(12); root.set_margin_end(12)
+        self.set_child(root)
+
+        title = Gtk.Label(label=f"All CPU Meter for Linux v{APP_VERSION}", xalign=0)
+        title.set_markup(f"<b>All CPU Meter for Linux v{APP_VERSION}</b>")
+        root.append(title)
+
+        notebook = Gtk.Notebook()
+        notebook.set_hexpand(True); notebook.set_vexpand(True)
+        root.append(notebook)
+
+        self.hw_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.display_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.style_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for box in (self.hw_box,self.display_box,self.style_box):
+            box.set_margin_top(10); box.set_margin_bottom(10)
+            box.set_margin_start(10); box.set_margin_end(10)
+        notebook.append_page(self.hw_box, Gtk.Label(label="Hardware"))
+        notebook.append_page(self.display_box, Gtk.Label(label="Display"))
+        notebook.append_page(self.style_box, Gtk.Label(label="Style"))
+
+        self.vars = {}
+        self.gpu_vars = {}
+        self.gpu_name_widgets = {}
+        self.build_hardware()
+        self.build_display()
+        self.build_style()
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        root.append(buttons)
+        stop = Gtk.Button(label="Stop Meter")
+        stop.connect("clicked", self.stop_meter)
+        buttons.append(stop)
+        start = Gtk.Button(label="Apply and Start Meter")
+        start.connect("clicked", self.apply_start)
+        start.set_hexpand(True)
+        start.set_halign(Gtk.Align.END)
+        buttons.append(start)
+
+    def name_controls(self, prefix, label_text, parent):
+        frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        parent.append(Gtk.Separator())
+        parent.append(Gtk.Label(label=label_text, xalign=0))
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.append(Gtk.Label(label="Name handling", xalign=0))
+        combo = Gtk.ComboBoxText()
+        combo.append("crop", "Crop")
+        combo.append("wrap", "Wrap")
+        combo.append("custom", "Custom")
+        combo.set_active_id(self.settings.get(f"{prefix}_name_mode", "crop"))
+        combo.set_hexpand(True)
+        combo.set_halign(Gtk.Align.END)
+        row.append(combo)
+        parent.append(row)
+        self.vars[f"{prefix}_name_mode"] = combo
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.append(Gtk.Label(label="Custom name", xalign=0))
+        entry = Gtk.Entry()
+        entry.set_text(self.settings.get(f"{prefix}_custom_name", ""))
+        entry.set_hexpand(True)
+        row.append(entry)
+        parent.append(row)
+        self.vars[f"{prefix}_custom_name"] = entry
+
+        def update_custom_state(*_args):
+            entry.set_sensitive(combo.get_active_id() == "custom")
+
+        combo.connect("changed", update_custom_state)
+        update_custom_state()
+
+    def switch(self, key, label, parent, default=True):
+        sw = Gtk.Switch(active=bool(self.settings.get(key, default)))
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.append(Gtk.Label(label=label, xalign=0))
+        sw.set_halign(Gtk.Align.END)
+        sw.set_hexpand(True)
+        row.append(sw)
+        parent.append(row)
+        self.vars[key] = sw
+        return sw
+
+    def build_hardware(self):
+        cpu = self.hardware["cpu"]
+        self.hw_box.append(Gtk.Label(label=f"CPU: {cpu['model']}", xalign=0))
+        self.hw_box.append(Gtk.Label(label=f"Logical CPUs: {cpu['logical_cpus']}", xalign=0))
+        self.hw_box.append(Gtk.Label(label=f"Network: {self.hardware['network']['primary']}", xalign=0))
+        self.hw_box.append(Gtk.Label(label=f"Root device: {self.hardware['disk']['root_device']}", xalign=0))
+        self.hw_box.append(Gtk.Separator())
+        for i,g in enumerate(self.hardware["gpus"],1):
+            self.hw_box.append(Gtk.Label(
+                label=f"GPU {i}: {g['description']} [{g['bdf']}; {g['backend_label']}]",
+                xalign=0, wrap=True
+            ))
+
+    def build_display(self):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.append(Gtk.Label(label="CPU detail", xalign=0))
+        combo = Gtk.ComboBoxText()
+        combo.append("overall", "Overall only")
+        combo.append("physical", "Physical cores")
+        combo.append("logical", "Logical CPUs / threads")
+        combo.set_active_id(self.settings.get("cpu_detail", "logical"))
+        combo.set_hexpand(True)
+        combo.set_halign(Gtk.Align.END)
+        row.append(combo)
+        self.display_box.append(row)
+        self.vars["cpu_detail"] = combo
+
+        self.switch("show_freq","Show CPU frequency",self.display_box,True)
+        self.switch("show_swap","Show swap",self.display_box,True)
+        self.name_controls("cpu", "CPU display name", self.display_box)
+        self.switch("show_network","Show network",self.display_box,True)
+        self.switch("show_disk","Show root disk",self.display_box,True)
+        self.switch("trendlines","Show trend graphs",self.display_box,True)
+        self.switch("gpu_vram","Show VRAM on NVIDIA/AMD GPUs",self.display_box,True)
+
+        self.display_box.append(Gtk.Separator())
+        self.display_box.append(Gtk.Label(label="Detected GPUs", xalign=0))
+        saved = self.settings.get("gpu_enabled",{})
+        saved_names = self.settings.get("gpu_names", {})
+
+        for i,g in enumerate(self.hardware["gpus"],1):
+            gpu_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+            gpu_box.set_margin_bottom(8)
+            self.display_box.append(gpu_box)
+
+            default = bool(g.get("backend_available"))
+            sw = Gtk.Switch(active=bool(saved.get(g["key"],default)))
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            row.append(Gtk.Label(
+                label=f"GPU {i}: {g['description']} [{g['backend_label']}]",
+                xalign=0, wrap=True
+            ))
+            sw.set_hexpand(True)
+            sw.set_halign(Gtk.Align.END)
+            row.append(sw)
+            gpu_box.append(row)
+            self.gpu_vars[g["key"]] = sw
+
+            current = saved_names.get(g["key"], {})
+            mode = Gtk.ComboBoxText()
+            mode.append("crop", "Crop")
+            mode.append("wrap", "Wrap")
+            mode.append("custom", "Custom")
+            mode.set_active_id(current.get("mode", "crop"))
+
+            custom = Gtk.Entry()
+            custom.set_text(current.get("custom", ""))
+            custom.set_placeholder_text("Optional custom name")
+
+            name_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            name_row.set_margin_start(16)
+            name_row.append(Gtk.Label(label="Display name", xalign=0))
+            mode.set_hexpand(True)
+            name_row.append(mode)
+            gpu_box.append(name_row)
+
+            custom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            custom_row.set_margin_start(16)
+            custom_row.append(Gtk.Label(label="Custom name", xalign=0))
+            custom.set_hexpand(True)
+            custom_row.append(custom)
+            gpu_box.append(custom_row)
+
+            def update_entry(combo, entry=custom):
+                entry.set_sensitive(combo.get_active_id() == "custom")
+
+            mode.connect("changed", update_entry)
+            update_entry(mode)
+            self.gpu_name_widgets[g["key"]] = (mode, custom)
+
+        # Intel-specific engine controls are only relevant when Intel graphics
+        # is actually present.
+        if any(g.get("vendor") == "intel" for g in self.hardware["gpus"]):
+            self.display_box.append(Gtk.Separator())
+            self.display_box.append(Gtk.Label(label="Intel GPU details", xalign=0))
+            self.switch("gpu_overall","Overall GPU",self.display_box,True)
+            self.switch("gpu_render","Render/3D",self.display_box,True)
+            self.switch("gpu_video","Video/QSV",self.display_box,True)
+            self.switch("gpu_video_enhance","Video Enhance",self.display_box,False)
+
+    def build_style(self):
+        self.switch("multicolor","Classic multicolor CPU bars",self.style_box,True)
+        self.switch("autostart","Start meter automatically at login",self.style_box,True)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.append(Gtk.Label(label="Preferred position", xalign=0))
+        combo = Gtk.ComboBoxText()
+        combo.append("top_right", "Top right")
+        combo.append("top_left", "Top left")
+        combo.append("bottom_right", "Bottom right")
+        combo.append("bottom_left", "Bottom left")
+        combo.set_active_id(self.settings.get("position", "top_right"))
+        combo.set_hexpand(True)
+        combo.set_halign(Gtk.Align.END)
+        row.append(combo)
+        self.style_box.append(row)
+        self.vars["position"] = combo
+
+        note = Gtk.Label(
+            label="GNOME/Wayland may ignore exact application placement, especially "
+                  "inside Remote Desktop sessions. The preference is retained, but "
+                  "the undecorated meter can always be dragged manually.",
+            xalign=0,
+            wrap=True,
+        )
+        note.add_css_class("muted")
+        self.style_box.append(note)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.append(Gtk.Label(label="Horizontal edge gap", xalign=0))
+        adj = Gtk.Adjustment(value=float(self.settings.get("gap_x",12)), lower=0, upper=500, step_increment=1)
+        spin = Gtk.SpinButton(adjustment=adj)
+        row.append(spin); self.style_box.append(row)
+        self.vars["gap_x"] = spin
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.append(Gtk.Label(label="Vertical edge gap", xalign=0))
+        adj = Gtk.Adjustment(value=float(self.settings.get("gap_y",40)), lower=0, upper=500, step_increment=1)
+        spin = Gtk.SpinButton(adjustment=adj)
+        row.append(spin); self.style_box.append(row)
+        self.vars["gap_y"] = spin
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.append(Gtk.Label(label="Panel width", xalign=0))
+        adj = Gtk.Adjustment(value=float(self.settings["width"]), lower=150, upper=500, step_increment=5)
+        spin = Gtk.SpinButton(adjustment=adj)
+        row.append(spin); self.style_box.append(row)
+        self.vars["width"] = spin
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.append(Gtk.Label(label="Refresh interval (seconds)", xalign=0))
+        adj = Gtk.Adjustment(value=float(self.settings["update_interval"]), lower=.25, upper=10, step_increment=.25)
+        spin = Gtk.SpinButton(adjustment=adj, digits=2)
+        row.append(spin); self.style_box.append(row)
+        self.vars["update_interval"] = spin
+
+    def collect(self):
+        out = dict(self.settings)
+        for key, widget in self.vars.items():
+            if isinstance(widget, Gtk.Switch):
+                out[key] = widget.get_active()
+            elif isinstance(widget, Gtk.SpinButton):
+                out[key] = widget.get_value()
+            elif isinstance(widget, Gtk.ComboBoxText):
+                out[key] = widget.get_active_id() or "crop"
+            elif isinstance(widget, Gtk.Entry):
+                out[key] = widget.get_text()
+        out["width"] = int(out["width"])
+        out["gap_x"] = int(out.get("gap_x",12))
+        out["gap_y"] = int(out.get("gap_y",40))
+        out["gpu_enabled"] = {k:v.get_active() for k,v in self.gpu_vars.items()}
+        out["gpu_names"] = {
+            key: {
+                "mode": widgets[0].get_active_id() or "crop",
+                "custom": widgets[1].get_text(),
+            }
+            for key, widgets in self.gpu_name_widgets.items()
+        }
+        return out
+
+    def apply_start(self, button):
+        settings = self.collect()
+        save_settings(settings)
+        set_autostart(settings.get("autostart",True))
+        subprocess.run(["pkill","-f",f"{SELF} --meter"],check=False)
+        subprocess.Popen(
+            [sys.executable, str(SELF), "--meter"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=dict(os.environ, ALLCPUMETER_METER="1"),
+        )
+
+    def stop_meter(self, button):
+        subprocess.run(["pkill","-f",f"{SELF} --meter"],check=False)
+
+
+def set_autostart(enabled):
+    AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
+    if not enabled:
+        AUTOSTART_FILE.unlink(missing_ok=True)
+        return
+    AUTOSTART_FILE.write_text(f"""[Desktop Entry]
+Type=Application
+Name=All CPU Meter
+Exec=python3 {SELF} --meter
+Terminal=false
+X-GNOME-Autostart-enabled=true
+""")
+
+
+class AllCpuMeterApp(Gtk.Application):
+    def __init__(self, meter_mode=False):
+        flags = Gio.ApplicationFlags.NON_UNIQUE if meter_mode else Gio.ApplicationFlags.DEFAULT_FLAGS
+        super().__init__(application_id=APP_ID, flags=flags)
+        self.meter_mode = meter_mode
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+    def do_activate(self):
+        settings = load_settings()
+        hardware = scan_hardware()
+        if self.meter_mode:
+            gtk_settings = Gtk.Settings.get_default()
+            if gtk_settings is not None:
+                gtk_settings.set_property("gtk-enable-animations", False)
+            win = MeterWindow(self, settings, hardware)
+        else:
+            win = ConfigWindow(self, settings, hardware)
+        win.present()
 
 
 def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument('--helper-temp',choices=['package','corelines'])
-    ap.add_argument('--helper-gpu',choices=['intel','nvidia','amd'])
-    ap.add_argument('--metric',choices=['overall','render','video','videoenhance','compute','vram_used','vram_total','vram_percent','vram_text'],default='overall')
-    ap.add_argument('--amd-path',default='')
-    ap.add_argument('--gpu-id',default='')
-    ap.add_argument('--intel-device',default='')
-    ap.add_argument('--logical-count',type=int)
-    ap.add_argument('--width',type=int,default=180)
-    ap.add_argument('--multicolor',type=int,default=1)
-    args=ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--meter", action="store_true")
+    args = parser.parse_args()
+    app = AllCpuMeterApp(meter_mode=args.meter)
+    return app.run(sys.argv[:1])
 
-    if args.helper_temp:
-        helper_temp(args.helper_temp,args.logical_count,args.width,bool(args.multicolor))
-    elif args.helper_gpu:
-        helper_gpu(args.helper_gpu,args.amd_path,args.metric,args.gpu_id,args.intel_device)
-    else:
-        launch_gui()
 
-if __name__=='__main__': main()
+if __name__ == "__main__":
+    raise SystemExit(main())
