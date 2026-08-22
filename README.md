@@ -1,26 +1,24 @@
-# All CPU Meter for Linux v0.1.2
+# All CPU Meter for Linux v0.2.0
 
 A compact Ubuntu desktop system monitor inspired by the classic Windows All CPU Meter gadget. The included configurator detects available hardware, lets the user choose the desired level of detail, then generates and launches a matching Conky panel.  Nothing here is revolutionary, but it is very automated so that you can (hopefully, if everything works) get a nice little resource monitor on your desktop with just a few clicks.  Look at the bars dance.  Numbers be numberin'.  Aren't they pretty?
 
-<img width="180" alt="The Meter" src="https://github.com/user-attachments/assets/9fe9c8ca-8611-4178-8231-a5d3f49b20c1" />
-
-<img width="600" alt="Some Settings" src="https://github.com/user-attachments/assets/6815bc45-79c1-446a-a735-9dc129438a40" />
+<img width="800" alt="Capture" src="https://github.com/user-attachments/assets/1ce9618a-7e8d-41e0-bdd1-118363a2bf21" />
 
 
 ## Testing status
 
-This release has been tested on Ubuntu Desktop 26.04 with an Intel CPU and Intel integrated graphics.
+This release has been tested on Ubuntu Desktop 26.04 with an Intel CPU and Intel integrated graphics, as well as Ubuntu 24.04 with AMD Epyc CPU and Nvidia graphics.
 
-AMD CPU temperature handling, AMD GPU utilization, and NVIDIA GPU utilization are implemented but have not been tested on actual hardware systems. Treat those backends as experimental.
+AMD GPU utilizationis implemented but has not been tested on actual hardware systems.
 
 ## Displays
 
 Depending on detected hardware and selected options, the panel can show:
 
-- Overall and per-core CPU utilization and frequency
+- Overall and per-core or per-thread CPU utilization and frequency
 - Package and per-core temperatures
 - RAM and swap usage
-- GPU & VRAM utilization
+- GPU & VRAM utilization plus GPU clock and temp.
 - Intel Render/3D, Video/QSV, and Video Enhance utilization
 - Root filesystem capacity and disk read/write activity
 - Network upload/download throughput and totals
@@ -30,12 +28,12 @@ CPU and GPU names can be cropped, wrapped, or replaced with a custom display nam
 
 ## Supported metric backends
 
-- CPU and memory: Linux `/proc` and Conky
+- CPU and memory: Linux `/proc`
 - Temperatures: `lm-sensors`
 - Intel GPU: `intel_gpu_top` from `intel-gpu-tools`
 - NVIDIA GPU: `nvidia-smi`
 - AMD GPU: kernel `gpu_busy_percent` interface when exposed
-- Disk and network: Conky/Linux system interfaces
+- Disk and network: Linux system interfaces
 
 ## Install
 
@@ -61,7 +59,7 @@ The application does not silently install optional monitoring tools.
 
 ### Upgrade All CPU Meter
 
-Do a git-pull and re-run the install script.
+Grab the latest version and re-run the install script.
 
 ## Uninstall
 
@@ -75,11 +73,17 @@ The code and documentation included in this project is primarily vibeslop. The h
 
 ## Current scope
 
-v0.1.0 targets Ubuntu/Debian systems using `apt`. Desktop placement has been tested on Ubuntu GNOME. Other distributions and desktop environments probably won't work without effort on your part.
+Targets Ubuntu/Debian systems using `apt`. Desktop placement is a bit wonky. Other distributions and desktop environments probably won't work without effort on your part.
 
 ## Revision History
 
+v0.2.0 GTK4 refactor. 
+
 v0.1.2 fixes multi-GPU support and adds some safeties for different display configs.  It falls on its face with weyland + nvidia + RDP though, due to known conky issues.  This will be the final conky-based version before refactoring.
+
+<img width="180" alt="The Meter" src="https://github.com/user-attachments/assets/9fe9c8ca-8611-4178-8231-a5d3f49b20c1" />
+
+<img width="600" alt="Some Settings" src="https://github.com/user-attachments/assets/6815bc45-79c1-446a-a735-9dc129438a40" />
 
 v0.1.1 fixes a severe crash on startup introduced by a weyland update.
 
