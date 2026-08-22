@@ -19,7 +19,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, Gio, GLib, Gdk, Pango
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 APP_ID = "io.github.allcpumeterlinux"
 APP_HOME = Path.home() / ".local" / "share" / "allcpumeter-linux"
 SETTINGS_DIR = Path.home() / ".config" / "allcpumeter-linux"
@@ -41,6 +41,7 @@ DEFAULTS = {
     "update_interval": 1.0,
     "per_core": True,
     "cpu_detail": "logical",
+    "compact_cores": False,
     "temp_mode": "package",
     "show_freq": True,
     "show_swap": True,
@@ -630,6 +631,25 @@ progressbar > trough > progress {
     min-width: 0;
     min-height: 6px;
 }
+progressbar.compact-core {
+    min-width: 0;
+    min-height: 3px;
+    padding: 0;
+}
+progressbar.compact-core > trough {
+    min-width: 0;
+    min-height: 3px;
+    max-height: 3px;
+    padding: 0;
+    border-width: 0;
+}
+progressbar.compact-core > trough > progress {
+    min-width: 0;
+    min-height: 3px;
+    max-height: 3px;
+    padding: 0;
+    border-width: 0;
+}
 progressbar.bar-purple > trough > progress { background-image: none; background-color: #c77dff; }
 progressbar.bar-yellow > trough > progress { background-image: none; background-color: #ffd93d; }
 progressbar.bar-cyan > trough > progress { background-image: none; background-color: #00d9ff; }
@@ -812,12 +832,14 @@ BAR_CLASSES = {
 }
 
 
-def progress(color):
+def progress(color, compact=False):
     bar = Gtk.ProgressBar()
     bar.set_show_text(False)
-    bar.set_size_request(8, -1)
+    bar.set_size_request(8, 3 if compact else -1)
     bar.set_hexpand(True)
     bar.add_css_class(BAR_CLASSES.get(color.lower(), "bar-blue"))
+    if compact:
+        bar.add_css_class("compact-core")
     return bar
 
 
@@ -858,13 +880,40 @@ class MeterWindow(Gtk.ApplicationWindow):
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         outer.add_css_class("meter-root")
-        self.set_child(outer)
+
+        self.viewport = Gtk.ScrolledWindow()
+        self.viewport.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.NEVER)
+        self.viewport.set_propagate_natural_width(True)
+        self.viewport.set_propagate_natural_height(True)
+        self.viewport.set_child(outer)
+        self.set_child(self.viewport)
+
         self.outer = outer
         self.build_ui()
+        self.connect("realize", self._limit_to_monitor)
 
         interval_ms = max(250, int(float(settings["update_interval"]) * 1000))
         self.refresh()
         GLib.timeout_add(interval_ms, self.refresh)
+
+    def _limit_to_monitor(self, *_args):
+        """Cap meter height to the monitor; excess content is clipped."""
+        try:
+            surface = self.get_surface()
+            display = Gdk.Display.get_default()
+            monitor = display.get_monitor_at_surface(surface) if surface is not None else None
+            if monitor is None:
+                monitors = display.get_monitors()
+                monitor = monitors.get_item(0) if monitors.get_n_items() else None
+            if monitor is None:
+                return
+
+            geometry = monitor.get_geometry()
+            max_height = max(200, int(geometry.height) - 48)
+            self.viewport.set_max_content_height(max_height)
+            self.viewport.set_propagate_natural_height(True)
+        except Exception:
+            pass
 
     def _apply_widget_window_hints(self, *_args):
         try:
@@ -974,17 +1023,35 @@ class MeterWindow(Gtk.ApplicationWindow):
                     "core_id": group["core_id"],
                 })
 
+        compact_cores = bool(s.get("compact_cores", False)) and detail in ("physical", "logical")
+        compact_box = None
+        if compact_cores and row_specs:
+            compact_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            compact_box.set_hexpand(True)
+            self.outer.append(compact_box)
+
         for i, spec in enumerate(row_specs):
+            color = PALETTE[i % len(PALETTE)] if s["multicolor"] else "#5da9ff"
+
+            if compact_cores:
+                bar = progress(color, compact=True)
+                compact_box.append(bar)
+                self.cpu_rows.append({
+                    "bar": bar,
+                    "right": None,
+                    "logicals": spec["logicals"],
+                    "core_id": spec["core_id"],
+                    "compact": True,
+                })
+                continue
+
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
             label = self.row_label(spec["label"])
             label.set_size_request(38, -1)
             label.set_hexpand(False)
-            color = PALETTE[i % len(PALETTE)] if s["multicolor"] else "#5da9ff"
             bar = progress(color)
             bar.set_hexpand(True)
             right = self.row_label("")
-            # Percentage-only mode needs very little space. Per-core temperature
-            # mode gets a wider value field for strings such as "42°C 100%".
             right_width = 29 if s.get("temp_mode") != "cores" else 55
             right.set_size_request(right_width, -1)
             right.set_hexpand(False)
@@ -996,6 +1063,7 @@ class MeterWindow(Gtk.ApplicationWindow):
                 "right": right,
                 "logicals": spec["logicals"],
                 "core_id": spec["core_id"],
+                "compact": False,
             })
 
         self.cpu_graph = None
@@ -1157,6 +1225,8 @@ class MeterWindow(Gtk.ApplicationWindow):
                 ))
             usage = sum(values) / len(values) if values else 0.0
             row["bar"].set_fraction(usage / 100.0)
+            if row.get("compact"):
+                continue
             if self.settings["temp_mode"] == "cores":
                 temp = cores_temp.get(row["core_id"])
                 row["right"].set_text(
@@ -1348,6 +1418,20 @@ class ConfigWindow(Gtk.ApplicationWindow):
         row.append(combo)
         self.display_box.append(row)
         self.vars["cpu_detail"] = combo
+
+        self.switch(
+            "compact_cores",
+            "Compact cores/threads",
+            self.display_box,
+            False
+        )
+        compact_note = Gtk.Label(
+            label="3 px bars with 2 px gaps; hides per-core labels, percentages, and temperatures.",
+            xalign=0,
+            wrap=True,
+        )
+        compact_note.add_css_class("muted")
+        self.display_box.append(compact_note)
 
         self.switch("show_freq","Show CPU frequency",self.display_box,True)
         self.switch("show_swap","Show swap",self.display_box,True)
