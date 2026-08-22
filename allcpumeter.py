@@ -19,7 +19,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, Gio, GLib, Gdk, Pango
 
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 APP_ID = "io.github.allcpumeterlinux"
 APP_HOME = Path.home() / ".local" / "share" / "allcpumeter-linux"
 SETTINGS_DIR = Path.home() / ".config" / "allcpumeter-linux"
@@ -46,7 +46,14 @@ DEFAULTS = {
     "show_freq": True,
     "show_swap": True,
     "show_network": True,
+    "network_enabled": {},
+    "network_names": {},
+    "network_order": [],
+    "compact_network_trends": False,
     "show_disk": True,
+    "disk_enabled": {},
+    "disk_names": {},
+    "disk_order": [],
     "trendlines": True,
     "multicolor": True,
     "autostart": True,
@@ -59,6 +66,7 @@ DEFAULTS = {
     "gpu_video": True,
     "gpu_video_enhance": False,
     "gpu_vram": True,
+    "compact_gpu_trends": False,
     "gpu_enabled": {},
     "gpu_names": {},
 }
@@ -167,6 +175,75 @@ def physical_core_groups():
         })
     return result
 
+
+def network_interfaces():
+    """Return real network interfaces, excluding loopback and common virtual links."""
+    base = Path("/sys/class/net")
+    if not base.exists():
+        return []
+
+    default = default_interface()
+    result = []
+
+    for p in sorted(base.iterdir(), key=lambda x: x.name):
+        name = p.name
+        if name == "lo" or name.startswith(
+            ("docker", "br-", "veth", "virbr", "tun", "tap", "wg", "tailscale")
+        ):
+            continue
+
+        try:
+            state = (p / "operstate").read_text().strip()
+        except Exception:
+            state = "unknown"
+
+        try:
+            mac = (p / "address").read_text().strip()
+        except Exception:
+            mac = ""
+
+        # Best-effort physical-device information.
+        device_path = ""
+        try:
+            device_path = str((p / "device").resolve())
+        except Exception:
+            pass
+
+        result.append({
+            "key": name,
+            "name": name,
+            "operstate": state,
+            "mac": mac,
+            "device_path": device_path,
+            "is_default": name == default,
+        })
+
+    return result
+
+
+def network_display_name(nic, settings=None):
+    settings = settings or {}
+    custom = (
+        settings.get("network_names", {}).get(nic.get("key", ""), "") or ""
+    ).strip()
+    return custom or nic.get("name", "NIC")
+
+
+def ordered_networks(networks, settings):
+    by_key = {n["key"]: n for n in networks}
+    result = []
+
+    for key in settings.get("network_order", []):
+        nic = by_key.pop(key, None)
+        if nic is not None:
+            result.append(nic)
+
+    # Default route first for newly discovered interfaces, then the rest.
+    remaining = list(by_key.values())
+    remaining.sort(key=lambda n: (not n.get("is_default", False), n.get("name", "")))
+    result.extend(remaining)
+    return result
+
 def default_interface():
     rc, out, _ = run(["ip", "route", "show", "default"])
     if rc == 0:
@@ -189,6 +266,133 @@ def root_device():
         s = s[5:]
     return s
 
+
+
+def _walk_lsblk(node):
+    """Yield a lsblk node and all descendants."""
+    yield node
+    for child in node.get("children") or []:
+        yield from _walk_lsblk(child)
+
+
+def physical_disks():
+    """Discover real block devices, including currently unmounted disks."""
+    columns = "NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,TRAN,FSTYPE,MOUNTPOINTS"
+    rc, out, _ = run(["lsblk", "-J", "-b", "-o", columns], 5)
+    if rc != 0 or not out:
+        return []
+
+    try:
+        data = json.loads(out)
+    except Exception:
+        return []
+
+    result = []
+    for root_node in data.get("blockdevices", []):
+        if root_node.get("type") != "disk":
+            continue
+
+        name = root_node.get("kname") or root_node.get("name") or ""
+        if not name or name.startswith(("loop", "ram", "zram")):
+            continue
+
+        mountpoints = []
+        seen = set()
+        for node in _walk_lsblk(root_node):
+            for mountpoint in node.get("mountpoints") or []:
+                if not mountpoint or mountpoint in seen:
+                    continue
+                # Ignore swap and pseudo mountpoints. statvfs() will verify the rest.
+                if mountpoint == "[SWAP]":
+                    continue
+                seen.add(mountpoint)
+                mountpoints.append(mountpoint)
+
+        model = (root_node.get("model") or "").strip()
+        serial = (root_node.get("serial") or "").strip()
+        transport = (root_node.get("tran") or "").strip()
+
+        result.append({
+            "key": name,
+            "name": name,
+            "path": root_node.get("path") or f"/dev/{name}",
+            "size": int(root_node.get("size") or 0),
+            "model": model,
+            "serial": serial,
+            "transport": transport,
+            "mountpoints": mountpoints,
+        })
+
+    return result
+
+
+def disk_capacity_stats(disk):
+    """Aggregate mounted filesystem capacity belonging to one physical disk."""
+    total = 0
+    used = 0
+    mounted = []
+
+    for mountpoint in disk.get("mountpoints", []):
+        try:
+            st = os.statvfs(mountpoint)
+            fs_total = st.f_blocks * st.f_frsize
+            fs_free = st.f_bavail * st.f_frsize
+            fs_used = max(0, fs_total - fs_free)
+        except Exception:
+            continue
+
+        # Avoid counting tiny pseudo filesystems that happen to appear below a
+        # device-mapper tree.
+        if fs_total <= 0:
+            continue
+        total += fs_total
+        used += fs_used
+        mounted.append(mountpoint)
+
+    if total > 0:
+        return {
+            "used": used,
+            "total": total,
+            "percent": used / total * 100.0,
+            "mounted": True,
+            "mountpoints": mounted,
+        }
+
+    return {
+        "used": 0,
+        "total": int(disk.get("size") or 0),
+        "percent": 0.0,
+        "mounted": False,
+        "mountpoints": [],
+    }
+
+
+def disk_display_name(disk, settings=None):
+    settings = settings or {}
+    custom = (settings.get("disk_names", {}).get(disk.get("key", ""), "") or "").strip()
+    if custom:
+        return custom
+
+    model = (disk.get("model") or "").strip()
+    name = disk.get("name") or "disk"
+    return f"{name}  {model}".strip() if model else name
+
+
+def ordered_disks(disks, settings):
+    """Return disks in saved user order, followed by newly discovered disks."""
+    by_key = {d["key"]: d for d in disks}
+    result = []
+
+    for key in settings.get("disk_order", []):
+        disk = by_key.pop(key, None)
+        if disk is not None:
+            result.append(disk)
+
+    for disk in disks:
+        if disk["key"] in by_key:
+            result.append(by_key.pop(disk["key"]))
+
+    return result
 
 def nvidia_inventory():
     if not shutil.which("nvidia-smi"):
@@ -275,7 +479,9 @@ def scan_hardware():
     return {
         "cpu": cpu_info(),
         "network": {"primary": default_interface()},
+        "networks": network_interfaces(),
         "disk": {"root_device": root_device()},
+        "disks": physical_disks(),
         "gpus": gpu_info(),
         "sensors_installed": shutil.which("sensors") is not None,
     }
@@ -430,8 +636,14 @@ def root_fs_stats():
     return used, total, (0 if total <= 0 else used / total * 100.0)
 
 
+
+def format_storage_gb(value):
+    """Compact storage capacity using conventional GB labeling."""
+    return f"{float(value) / (1024 ** 3):.1f} GB"
+
 def format_bytes(value):
-    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    # Compact conventional labels. Values still use 1024-based scaling.
+    units = ["B", "KB", "MB", "GB", "TB"]
     v = float(value)
     for unit in units:
         if abs(v) < 1024.0 or unit == units[-1]:
@@ -675,7 +887,7 @@ class TrendGraph(Gtk.Picture):
     """History graph rendered to a tiny PNG for maximum GTK/RDP compatibility."""
     _serial = 0
 
-    def __init__(self, traces=1, colors=None, height=30, width=160):
+    def __init__(self, traces=1, colors=None, height=30, width=160, auto_scale=False):
         super().__init__()
         TrendGraph._serial += 1
         self.graph_id = TrendGraph._serial
@@ -684,6 +896,7 @@ class TrendGraph(Gtk.Picture):
         self.graph_width = max(80, int(width))
         self.graph_height = max(18, int(height))
         self.frame_no = 0
+        self.auto_scale = bool(auto_scale)
 
         cache = Path.home() / ".cache" / "allcpumeter-linux" / "graphs"
         cache.mkdir(parents=True, exist_ok=True)
@@ -706,7 +919,10 @@ class TrendGraph(Gtk.Picture):
                 value = float(value)
             except Exception:
                 value = 0.0
-            hist.append(max(0.0, min(100.0, value)))
+            if self.auto_scale:
+                hist.append(max(0.0, value))
+            else:
+                hist.append(max(0.0, min(100.0, value)))
         self._render()
 
     def _render(self):
@@ -768,8 +984,19 @@ class TrendGraph(Gtk.Picture):
         vline(0, 0, h - 1, border)
         vline(w - 1, 0, h - 1, border)
 
+        graph_scale = 100.0
+        if self.auto_scale:
+            peak = max(
+                (max(hist) if hist else 0.0)
+                for hist in self.histories
+            )
+            # Keep tiny idle noise readable but avoid a scale of zero.
+            graph_scale = max(1024.0, peak * 1.10)
+
         def py(value):
-            return int(round((h - 3) - (value / 100.0) * max(1, h - 5)))
+            normalized = (value / graph_scale) * 100.0
+            normalized = max(0.0, min(100.0, normalized))
+            return int(round((h - 3) - (normalized / 100.0) * max(1, h - 5)))
 
         for hist, color in zip(self.histories, self.colors):
             if not hist:
@@ -869,8 +1096,14 @@ class MeterWindow(Gtk.ApplicationWindow):
         self.add_controller(drag)
 
         self.prev_cpu = read_proc_stat()
-        self.prev_net = net_bytes(hardware["network"]["primary"])
-        self.prev_disk = disk_stats(hardware["disk"]["root_device"])
+        self.prev_nets = {
+            nic["key"]: net_bytes(nic["name"])
+            for nic in hardware.get("networks", [])
+        }
+        self.prev_disks = {
+            d["key"]: disk_stats(d["name"])
+            for d in hardware.get("disks", [])
+        }
         self.prev_time = time.monotonic()
 
         self.cpu_rows = []
@@ -1093,89 +1326,276 @@ class MeterWindow(Gtk.ApplicationWindow):
             g for g in self.hardware["gpus"]
             if enabled.get(g["key"], g.get("backend_available", False))
         ]
-        for idx, gpu in enumerate(selected, 1):
-            self.title("GPU METER" if len(selected) == 1 else f"GPU {idx} METER")
-            gpu_name_settings = s.get("gpu_names", {}).get(gpu["key"], {})
-            gpu_name_mode = gpu_name_settings.get(
-                "mode", s.get("gpu_name_mode", "crop")
-            )
-            gpu_custom_name = gpu_name_settings.get(
-                "custom", s.get("gpu_custom_name", "")
-            )
-            name = self.row_label(display_name(
-                gpu["description"], gpu_name_mode, gpu_custom_name, s["width"]
-            ), "muted")
-            if gpu_name_mode == "wrap":
-                name.set_ellipsize(Pango.EllipsizeMode.NONE)
-                name.set_wrap(True)
-                name.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-            self.outer.append(name)
 
-            metric_rows = []
-            if gpu["vendor"] == "intel":
-                metrics = []
-                if s["gpu_overall"]: metrics.append(("GPU","overall","#c77dff"))
-                if s["gpu_render"]: metrics.append(("Render/3D","render","#00ff66"))
-                if s["gpu_video"]: metrics.append(("Video/QSV","video","#ffd93d"))
-                if s["gpu_video_enhance"]: metrics.append(("Video Enhance","videoenhance","#00d9ff"))
-            else:
-                metrics = [("GPU","overall","#c77dff")]
+        self.gpu_compact_graph = None
+        if selected:
+            self.title("GPU METER")
 
-            for label_text, metric, color in metrics:
-                metric_row, _, label = self.metric_pair(label_text, "")
-                bar = progress(color)
-                self.outer.append(metric_row); self.outer.append(bar)
-                metric_rows.append((metric, label_text, label, bar))
+            gpu_colors = [
+                PALETTE[i % len(PALETTE)]
+                for i in range(len(selected))
+            ]
+            compact_gpu_trends = bool(s.get("compact_gpu_trends", False))
 
-            vram_label = vram_bar = None
-            if s["gpu_vram"] and gpu["vendor"] in ("nvidia","amd"):
-                vram_row, _, vram_label = self.metric_pair("VRAM", "")
-                vram_bar = progress("#5da9ff")
-                self.outer.append(vram_row); self.outer.append(vram_bar)
+            for idx, (gpu, gpu_color) in enumerate(zip(selected, gpu_colors)):
+                if idx > 0:
+                    self.outer.append(Gtk.Separator())
 
-            status_row, self.gpu_temp_label, self.gpu_clock_label = self.metric_pair("", "", "muted")
-            self.outer.append(status_row)
+                gpu_name_settings = s.get("gpu_names", {}).get(gpu["key"], {})
+                gpu_name_mode = gpu_name_settings.get(
+                    "mode", s.get("gpu_name_mode", "crop")
+                )
+                gpu_custom_name = gpu_name_settings.get(
+                    "custom", s.get("gpu_custom_name", "")
+                )
+                name = self.row_label(display_name(
+                    gpu["description"], gpu_name_mode, gpu_custom_name, s["width"]
+                ), "muted")
+                if gpu_name_mode == "wrap":
+                    name.set_ellipsize(Pango.EllipsizeMode.NONE)
+                    name.set_wrap(True)
+                    name.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+                self.outer.append(name)
 
-            graph = None
-            if s["trendlines"]:
-                graph = TrendGraph(1, ["#c77dff"], 28, max(80, self.panel_width - 16))
-                self.outer.append(graph)
+                metric_rows = []
+                if gpu["vendor"] == "intel":
+                    metrics = []
+                    if s["gpu_overall"]:
+                        metrics.append(("GPU", "overall", gpu_color))
+                    if s["gpu_render"]:
+                        metrics.append(("Render/3D", "render", "#00ff66"))
+                    if s["gpu_video"]:
+                        metrics.append(("Video/QSV", "video", "#ffd93d"))
+                    if s["gpu_video_enhance"]:
+                        metrics.append(("Video Enhance", "videoenhance", "#00d9ff"))
+                else:
+                    metrics = [("GPU", "overall", gpu_color)]
 
-            self.gpu_rows.append({
-                "gpu": gpu, "metrics": metric_rows,
-                "vram_label": vram_label, "vram_bar": vram_bar,
-                "temp_label": self.gpu_temp_label,
-                "clock_label": self.gpu_clock_label,
-                "graph": graph
-            })
+                for label_text, metric, color in metrics:
+                    metric_row, _, label = self.metric_pair(label_text, "")
+                    bar = progress(color)
+                    self.outer.append(metric_row)
+                    self.outer.append(bar)
+                    metric_rows.append((metric, label_text, label, bar))
+
+                vram_label = vram_bar = None
+                if s["gpu_vram"] and gpu["vendor"] in ("nvidia", "amd"):
+                    vram_row, _, vram_label = self.metric_pair("VRAM", "")
+                    vram_bar = progress("#5da9ff")
+                    self.outer.append(vram_row)
+                    self.outer.append(vram_bar)
+
+                status_row, temp_label, clock_label = self.metric_pair("", "", "muted")
+                self.outer.append(status_row)
+
+                graph = None
+                if s["trendlines"] and not compact_gpu_trends:
+                    graph = TrendGraph(
+                        1,
+                        [gpu_color],
+                        28,
+                        max(80, self.panel_width - 16),
+                    )
+                    self.outer.append(graph)
+
+                self.gpu_rows.append({
+                    "gpu": gpu,
+                    "color": gpu_color,
+                    "metrics": metric_rows,
+                    "vram_label": vram_label,
+                    "vram_bar": vram_bar,
+                    "temp_label": temp_label,
+                    "clock_label": clock_label,
+                    "graph": graph,
+                })
+
+            if s["trendlines"] and compact_gpu_trends:
+                self.gpu_compact_graph = TrendGraph(
+                    len(selected),
+                    gpu_colors,
+                    32,
+                    max(80, self.panel_width - 16),
+                )
+                self.outer.append(self.gpu_compact_graph)
+
+        self.network_rows = []
+        self.network_compact_graph = None
 
         if s["show_network"]:
-            self.title("NETWORK")
-            row, _, self.net_iface = self.metric_pair("Interface", "", "muted")
-            self.outer.append(row)
-            row, _, self.net_down = self.metric_pair("Down", "")
-            self.outer.append(row)
-            row, _, self.net_up = self.metric_pair("Up", "")
-            self.outer.append(row)
-            self.net_graph = TrendGraph(2, ["#5da9ff","#ff9f43"], 32, max(80, self.panel_width - 16)) if s["trendlines"] else None
-            if self.net_graph: self.outer.append(self.net_graph)
-        else:
-            self.net_graph = None
+            enabled = s.get("network_enabled", {})
+            selected_networks = [
+                nic for nic in ordered_networks(
+                    self.hardware.get("networks", []), s
+                )
+                if bool(enabled.get(nic["key"], True))
+            ]
+
+            if selected_networks:
+                self.title("NETWORK")
+                nic_colors = [
+                    PALETTE[i % len(PALETTE)]
+                    for i in range(len(selected_networks))
+                ]
+                compact_network_trends = bool(
+                    s.get("compact_network_trends", False)
+                )
+
+                for idx, (nic, color) in enumerate(
+                    zip(selected_networks, nic_colors)
+                ):
+                    if idx > 0:
+                        self.outer.append(Gtk.Separator())
+
+                    name = self.row_label(
+                        network_display_name(nic, s),
+                        "muted",
+                    )
+                    self.outer.append(name)
+
+                    io_row = Gtk.Box(
+                        orientation=Gtk.Orientation.HORIZONTAL,
+                        spacing=4,
+                    )
+
+                    down_group = Gtk.Box(
+                        orientation=Gtk.Orientation.HORIZONTAL,
+                        spacing=3,
+                    )
+                    down_group.set_hexpand(False)
+                    down_group.set_halign(Gtk.Align.START)
+                    down_label = Gtk.Label(label="D", xalign=0)
+                    down_label.add_css_class("metric-label")
+                    down_value = Gtk.Label(label="", xalign=0)
+                    down_value.add_css_class("metric-label")
+                    down_group.append(down_label)
+                    down_group.append(down_value)
+
+                    spacer = Gtk.Box()
+                    spacer.set_hexpand(True)
+
+                    up_group = Gtk.Box(
+                        orientation=Gtk.Orientation.HORIZONTAL,
+                        spacing=3,
+                    )
+                    up_group.set_hexpand(False)
+                    up_group.set_halign(Gtk.Align.END)
+                    up_label = Gtk.Label(label="U", xalign=0)
+                    up_label.add_css_class("metric-label")
+                    up_value = Gtk.Label(label="", xalign=0)
+                    up_value.add_css_class("metric-label")
+                    up_group.append(up_label)
+                    up_group.append(up_value)
+
+                    io_row.append(down_group)
+                    io_row.append(spacer)
+                    io_row.append(up_group)
+                    self.outer.append(io_row)
+
+                    graph = None
+                    if s["trendlines"] and not compact_network_trends:
+                        # Individual NIC graph contains down and up traces.
+                        graph = TrendGraph(
+                            2,
+                            [color, "#ff9f43"],
+                            32,
+                            max(80, self.panel_width - 16),
+                            auto_scale=True,
+                        )
+                        self.outer.append(graph)
+
+                    self.network_rows.append({
+                        "nic": nic,
+                        "color": color,
+                        "down_value": down_value,
+                        "up_value": up_value,
+                        "graph": graph,
+                    })
+
+                if s["trendlines"] and compact_network_trends:
+                    self.network_compact_graph = TrendGraph(
+                        len(selected_networks),
+                        nic_colors,
+                        32,
+                        max(80, self.panel_width - 16),
+                        auto_scale=True,
+                    )
+                    self.outer.append(self.network_compact_graph)
+
+        self.disk_rows = []
+        self.disk_graph = None
 
         if s["show_disk"]:
-            self.title("DISK")
-            row, self.disk_path_label, self.disk_usage = self.metric_pair("/", "")
-            self.outer.append(row)
-            self.disk_bar = progress("#ff5e5e")
-            self.outer.append(self.disk_bar)
-            row, _, self.disk_read = self.metric_pair("Read", "")
-            self.outer.append(row)
-            row, _, self.disk_write = self.metric_pair("Write", "")
-            self.outer.append(row)
-            self.disk_graph = TrendGraph(2, ["#5da9ff","#ff9f43"], 28, max(80, self.panel_width - 16)) if s["trendlines"] else None
-            if self.disk_graph: self.outer.append(self.disk_graph)
-        else:
-            self.disk_graph = None
+            enabled = s.get("disk_enabled", {})
+            selected_disks = [
+                d for d in ordered_disks(self.hardware.get("disks", []), s)
+                if bool(enabled.get(d["key"], True))
+            ]
+
+            if selected_disks:
+                self.title("DISKS")
+
+                disk_colors = [
+                    PALETTE[i % len(PALETTE)]
+                    for i in range(len(selected_disks))
+                ]
+
+                for disk, color in zip(selected_disks, disk_colors):
+                    name = self.row_label(disk_display_name(disk, s), "muted")
+                    self.outer.append(name)
+
+                    row, _, capacity_label = self.metric_pair("", "")
+                    self.outer.append(row)
+                    capacity_bar = progress(color)
+                    self.outer.append(capacity_bar)
+
+                    io_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+
+                    read_group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+                    read_group.set_hexpand(False)
+                    read_group.set_halign(Gtk.Align.START)
+                    r_label = Gtk.Label(label="R", xalign=0)
+                    r_label.add_css_class("metric-label")
+                    r_value = Gtk.Label(label="", xalign=0)
+                    r_value.add_css_class("metric-label")
+                    read_group.append(r_label)
+                    read_group.append(r_value)
+
+                    spacer = Gtk.Box()
+                    spacer.set_hexpand(True)
+
+                    write_group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+                    write_group.set_hexpand(False)
+                    write_group.set_halign(Gtk.Align.END)
+                    w_label = Gtk.Label(label="W", xalign=0)
+                    w_label.add_css_class("metric-label")
+                    w_value = Gtk.Label(label="", xalign=0)
+                    w_value.add_css_class("metric-label")
+                    write_group.append(w_label)
+                    write_group.append(w_value)
+
+                    io_row.append(read_group)
+                    io_row.append(spacer)
+                    io_row.append(write_group)
+                    self.outer.append(io_row)
+
+                    self.disk_rows.append({
+                        "disk": disk,
+                        "color": color,
+                        "capacity_label": capacity_label,
+                        "capacity_bar": capacity_bar,
+                        "read_label": r_value,
+                        "write_label": w_value,
+                    })
+
+                if s["trendlines"]:
+                    self.disk_graph = TrendGraph(
+                        len(selected_disks),
+                        disk_colors,
+                        32,
+                        max(80, self.panel_width - 16),
+                        auto_scale=True,
+                    )
+                    self.outer.append(self.disk_graph)
 
     def gpu_stats(self, gpu):
         if gpu["vendor"] == "nvidia":
@@ -1244,8 +1664,10 @@ class MeterWindow(Gtk.ApplicationWindow):
             self.swap_label.set_text(f"{format_bytes(mem['swap_used'])} / {format_bytes(mem['swap_total'])}  {mem['swap_percent']:.0f}%")
             self.swap_bar.set_fraction(mem["swap_percent"] / 100.0)
 
+        compact_gpu_values = []
         for row in self.gpu_rows:
             stats = self.gpu_stats(row["gpu"])
+            compact_gpu_values.append(float(stats.get("overall", 0.0) or 0.0))
             for metric, label_text, label, bar in row["metrics"]:
                 value = float(stats.get(metric, 0.0) or 0.0)
                 label.set_text(f"{value:.0f}%")
@@ -1257,7 +1679,7 @@ class MeterWindow(Gtk.ApplicationWindow):
                 if used is None or total is None:
                     row["vram_label"].set_text("N/A")
                 else:
-                    row["vram_label"].set_text(f"{used/1024:.2f} / {total/1024:.2f} GiB  {pct:.0f}%")
+                    row["vram_label"].set_text(f"{used/1024:.2f} / {total/1024:.2f} GB  {pct:.0f}%")
                 row["vram_bar"].set_fraction(max(0.0, min(1.0, pct / 100.0)))
             temp = stats.get("temp")
             clock = stats.get("clock_mhz")
@@ -1265,35 +1687,70 @@ class MeterWindow(Gtk.ApplicationWindow):
             row["clock_label"].set_text("" if clock is None else f"Clock {float(clock):.0f} MHz")
 
             if row["graph"]:
-                row["graph"].push(float(stats.get("overall",0.0) or 0.0))
+                row["graph"].push(float(stats.get("overall", 0.0) or 0.0))
 
-        if self.settings["show_network"]:
-            iface = self.hardware["network"]["primary"]
-            cur_net = net_bytes(iface)
-            down = max(0, cur_net[0] - self.prev_net[0]) / elapsed
-            up = max(0, cur_net[1] - self.prev_net[1]) / elapsed
-            self.net_iface.set_text(iface)
-            self.net_down.set_markup(f'<span foreground="#5da9ff">{format_bytes(down)}/s</span>')
-            self.net_up.set_markup(f'<span foreground="#ff9f43">{format_bytes(up)}/s</span>')
-            if self.net_graph:
-                # Relative autoscale would be more diagnostic; for now use 100 MiB/s full scale.
-                self.net_graph.push(min(100, down / (100*1024*1024) * 100),
-                                    min(100, up / (100*1024*1024) * 100))
-            self.prev_net = cur_net
+        if self.gpu_compact_graph and compact_gpu_values:
+            self.gpu_compact_graph.push(*compact_gpu_values)
 
-        if self.settings["show_disk"]:
-            used, total, pct = root_fs_stats()
-            self.disk_usage.set_text(f"{format_bytes(used)} / {format_bytes(total)}  {pct:.0f}%")
-            self.disk_bar.set_fraction(pct / 100.0)
-            cur_disk = disk_stats(self.hardware["disk"]["root_device"])
-            rd = max(0, cur_disk[0] - self.prev_disk[0]) / elapsed
-            wr = max(0, cur_disk[1] - self.prev_disk[1]) / elapsed
-            self.disk_read.set_markup(f'<span foreground="#5da9ff">{format_bytes(rd)}/s</span>')
-            self.disk_write.set_markup(f'<span foreground="#ff9f43">{format_bytes(wr)}/s</span>')
+        if self.settings["show_network"] and self.network_rows:
+            compact_network_values = []
+
+            for row in self.network_rows:
+                nic = row["nic"]
+                current = net_bytes(nic["name"])
+                previous = self.prev_nets.get(nic["key"], current)
+
+                down = max(0, current[0] - previous[0]) / elapsed
+                up = max(0, current[1] - previous[1]) / elapsed
+                activity = down + up
+
+                row["down_value"].set_text(f"{format_bytes(down)}/s")
+                row["up_value"].set_text(f"{format_bytes(up)}/s")
+
+                if row["graph"]:
+                    row["graph"].push(down, up)
+
+                compact_network_values.append(activity)
+                self.prev_nets[nic["key"]] = current
+
+            if self.network_compact_graph and compact_network_values:
+                self.network_compact_graph.push(*compact_network_values)
+
+        if self.settings["show_disk"] and self.disk_rows:
+            activities = []
+
+            for row in self.disk_rows:
+                disk = row["disk"]
+                capacity = disk_capacity_stats(disk)
+
+                if capacity["mounted"]:
+                    row["capacity_label"].set_text(
+                        f"{format_storage_gb(capacity['used'])} / "
+                        f"{format_storage_gb(capacity['total'])}  "
+                        f"{capacity['percent']:.0f}%"
+                    )
+                    row["capacity_bar"].set_fraction(
+                        max(0.0, min(1.0, capacity["percent"] / 100.0))
+                    )
+                else:
+                    row["capacity_label"].set_text(
+                        f"Unmounted / {format_storage_gb(capacity['total'])}"
+                    )
+                    row["capacity_bar"].set_fraction(0.0)
+
+                current = disk_stats(disk["name"])
+                previous = self.prev_disks.get(disk["key"], current)
+                read_rate = max(0, current[0] - previous[0]) / elapsed
+                write_rate = max(0, current[1] - previous[1]) / elapsed
+                activity = read_rate + write_rate
+
+                row["read_label"].set_text(f"{format_bytes(read_rate)}/s")
+                row["write_label"].set_text(f"{format_bytes(write_rate)}/s")
+                activities.append(activity)
+                self.prev_disks[disk["key"]] = current
+
             if self.disk_graph:
-                self.disk_graph.push(min(100, rd / (500*1024*1024) * 100),
-                                     min(100, wr / (500*1024*1024) * 100))
-            self.prev_disk = cur_disk
+                self.disk_graph.push(*activities)
 
         self.prev_cpu = cur_cpu
         self.prev_time = now
@@ -1305,7 +1762,7 @@ class ConfigWindow(Gtk.ApplicationWindow):
         super().__init__(application=app, title=f"All CPU Meter for Linux v{APP_VERSION}")
         self.settings = settings
         self.hardware = hardware
-        self.set_default_size(760, 680)
+        self.set_default_size(760, 560)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         root.set_margin_top(12); root.set_margin_bottom(12)
@@ -1323,16 +1780,30 @@ class ConfigWindow(Gtk.ApplicationWindow):
         self.hw_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.display_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.style_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        for box in (self.hw_box,self.display_box,self.style_box):
+
+        def scroll_page(box):
             box.set_margin_top(10); box.set_margin_bottom(10)
             box.set_margin_start(10); box.set_margin_end(10)
-        notebook.append_page(self.hw_box, Gtk.Label(label="Hardware"))
-        notebook.append_page(self.display_box, Gtk.Label(label="Display"))
-        notebook.append_page(self.style_box, Gtk.Label(label="Style"))
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroller.set_vexpand(True)
+            scroller.set_hexpand(True)
+            scroller.set_child(box)
+            return scroller
+
+        notebook.append_page(scroll_page(self.hw_box), Gtk.Label(label="Hardware"))
+        notebook.append_page(scroll_page(self.display_box), Gtk.Label(label="Display"))
+        notebook.append_page(scroll_page(self.style_box), Gtk.Label(label="Style"))
 
         self.vars = {}
         self.gpu_vars = {}
         self.gpu_name_widgets = {}
+        self.disk_vars = {}
+        self.disk_name_entries = {}
+        self.disk_order = []
+        self.network_vars = {}
+        self.network_name_entries = {}
+        self.network_order = []
         self.build_hardware()
         self.build_display()
         self.build_style()
@@ -1396,8 +1867,28 @@ class ConfigWindow(Gtk.ApplicationWindow):
         cpu = self.hardware["cpu"]
         self.hw_box.append(Gtk.Label(label=f"CPU: {cpu['model']}", xalign=0))
         self.hw_box.append(Gtk.Label(label=f"Logical CPUs: {cpu['logical_cpus']}", xalign=0))
-        self.hw_box.append(Gtk.Label(label=f"Network: {self.hardware['network']['primary']}", xalign=0))
+        self.hw_box.append(Gtk.Label(
+            label=f"Primary network: {self.hardware['network']['primary']}",
+            xalign=0
+        ))
+        for i, nic in enumerate(self.hardware.get("networks", []), 1):
+            details = f"NIC {i}: {nic['name']} [{nic.get('operstate','unknown')}]"
+            if nic.get("mac"):
+                details += f" {nic['mac']}"
+            self.hw_box.append(Gtk.Label(label=details, xalign=0, wrap=True))
         self.hw_box.append(Gtk.Label(label=f"Root device: {self.hardware['disk']['root_device']}", xalign=0))
+        self.hw_box.append(Gtk.Separator())
+        for i, disk in enumerate(self.hardware.get("disks", []), 1):
+            mounts = ", ".join(disk.get("mountpoints", [])) or "unmounted"
+            self.hw_box.append(Gtk.Label(
+                label=(
+                    f"Disk {i}: {disk_display_name(disk)} "
+                    f"[{format_bytes(disk.get('size', 0))}; {mounts}]"
+                ),
+                xalign=0,
+                wrap=True,
+            ))
+
         self.hw_box.append(Gtk.Separator())
         for i,g in enumerate(self.hardware["gpus"],1):
             self.hw_box.append(Gtk.Label(
@@ -1436,10 +1927,234 @@ class ConfigWindow(Gtk.ApplicationWindow):
         self.switch("show_freq","Show CPU frequency",self.display_box,True)
         self.switch("show_swap","Show swap",self.display_box,True)
         self.name_controls("cpu", "CPU display name", self.display_box)
-        self.switch("show_network","Show network",self.display_box,True)
-        self.switch("show_disk","Show root disk",self.display_box,True)
+        self.switch("show_network","Show network interfaces",self.display_box,True)
+        self.switch("show_disk","Show disks",self.display_box,True)
         self.switch("trendlines","Show trend graphs",self.display_box,True)
         self.switch("gpu_vram","Show VRAM on NVIDIA/AMD GPUs",self.display_box,True)
+
+        self.display_box.append(Gtk.Separator())
+        self.display_box.append(Gtk.Label(label="Detected network interfaces", xalign=0))
+
+        saved_networks = self.settings.get("network_enabled", {})
+        saved_network_names = self.settings.get("network_names", {})
+
+        network_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.display_box.append(network_list)
+
+        self.network_order = [
+            nic["key"] for nic in ordered_networks(
+                self.hardware.get("networks", []), self.settings
+            )
+        ]
+
+        def rebuild_network_controls():
+            child = network_list.get_first_child()
+            while child is not None:
+                nxt = child.get_next_sibling()
+                network_list.remove(child)
+                child = nxt
+
+            by_key = {
+                nic["key"]: nic
+                for nic in self.hardware.get("networks", [])
+            }
+
+            for pos, key in enumerate(self.network_order):
+                nic = by_key.get(key)
+                if nic is None:
+                    continue
+
+                card = Gtk.Box(
+                    orientation=Gtk.Orientation.VERTICAL,
+                    spacing=4,
+                )
+                network_list.append(card)
+
+                top = Gtk.Box(
+                    orientation=Gtk.Orientation.HORIZONTAL,
+                    spacing=6,
+                )
+                card.append(top)
+
+                details = nic["name"]
+                if nic.get("is_default"):
+                    details += " [default]"
+                if nic.get("operstate"):
+                    details += f" [{nic['operstate']}]"
+
+                label = Gtk.Label(
+                    label=details,
+                    xalign=0,
+                    wrap=True,
+                )
+                label.set_hexpand(True)
+                top.append(label)
+
+                up_btn = Gtk.Button(label="↑")
+                down_btn = Gtk.Button(label="↓")
+                up_btn.set_sensitive(pos > 0)
+                down_btn.set_sensitive(
+                    pos < len(self.network_order) - 1
+                )
+
+                def move_up(_button, key=key):
+                    idx = self.network_order.index(key)
+                    if idx > 0:
+                        self.network_order[idx-1], self.network_order[idx] = (
+                            self.network_order[idx],
+                            self.network_order[idx-1],
+                        )
+                        rebuild_network_controls()
+
+                def move_down(_button, key=key):
+                    idx = self.network_order.index(key)
+                    if idx < len(self.network_order) - 1:
+                        self.network_order[idx+1], self.network_order[idx] = (
+                            self.network_order[idx],
+                            self.network_order[idx+1],
+                        )
+                        rebuild_network_controls()
+
+                up_btn.connect("clicked", move_up)
+                down_btn.connect("clicked", move_down)
+                top.append(up_btn)
+                top.append(down_btn)
+
+                sw = self.network_vars.get(key)
+                if sw is None:
+                    sw = Gtk.Switch(
+                        active=bool(saved_networks.get(key, True))
+                    )
+                    self.network_vars[key] = sw
+                top.append(sw)
+
+                name_row = Gtk.Box(
+                    orientation=Gtk.Orientation.HORIZONTAL,
+                    spacing=6,
+                )
+                name_row.set_margin_start(16)
+                card.append(name_row)
+                name_row.append(
+                    Gtk.Label(label="Custom name", xalign=0)
+                )
+
+                entry = self.network_name_entries.get(key)
+                if entry is None:
+                    entry = Gtk.Entry()
+                    entry.set_text(saved_network_names.get(key, ""))
+                    self.network_name_entries[key] = entry
+                entry.set_hexpand(True)
+                entry.set_placeholder_text("Use interface name")
+                name_row.append(entry)
+
+        rebuild_network_controls()
+
+        if len(self.hardware.get("networks", [])) > 1:
+            self.switch(
+                "compact_network_trends",
+                "Compact network trends",
+                self.display_box,
+                False,
+            )
+            network_note = Gtk.Label(
+                label=(
+                    "Use one shared network activity graph with one "
+                    "color-coded trace per enabled interface."
+                ),
+                xalign=0,
+                wrap=True,
+            )
+            network_note.add_css_class("muted")
+            self.display_box.append(network_note)
+
+        self.display_box.append(Gtk.Separator())
+        self.display_box.append(Gtk.Label(label="Detected physical disks", xalign=0))
+        saved_disks = self.settings.get("disk_enabled", {})
+        saved_names = self.settings.get("disk_names", {})
+
+        disk_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.display_box.append(disk_list)
+        self.disk_list_box = disk_list
+
+        self.disk_order = [d["key"] for d in ordered_disks(
+            self.hardware.get("disks", []), self.settings
+        )]
+
+        def rebuild_disk_controls():
+            child = disk_list.get_first_child()
+            while child is not None:
+                nxt = child.get_next_sibling()
+                disk_list.remove(child)
+                child = nxt
+
+            by_key = {d["key"]: d for d in self.hardware.get("disks", [])}
+            for pos, key in enumerate(self.disk_order):
+                disk = by_key.get(key)
+                if disk is None:
+                    continue
+
+                card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+                disk_list.append(card)
+
+                top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                card.append(top)
+
+                details = disk_display_name(disk)
+                if disk.get("transport"):
+                    details += f" [{disk['transport']}]"
+                details += f"  {format_storage_gb(disk.get('size', 0))}"
+
+                label = Gtk.Label(label=details, xalign=0, wrap=True)
+                label.set_hexpand(True)
+                top.append(label)
+
+                up = Gtk.Button(label="↑")
+                down = Gtk.Button(label="↓")
+                up.set_sensitive(pos > 0)
+                down.set_sensitive(pos < len(self.disk_order) - 1)
+
+                def move_up(_button, key=key):
+                    idx = self.disk_order.index(key)
+                    if idx > 0:
+                        self.disk_order[idx-1], self.disk_order[idx] = (
+                            self.disk_order[idx], self.disk_order[idx-1]
+                        )
+                        rebuild_disk_controls()
+
+                def move_down(_button, key=key):
+                    idx = self.disk_order.index(key)
+                    if idx < len(self.disk_order) - 1:
+                        self.disk_order[idx+1], self.disk_order[idx] = (
+                            self.disk_order[idx], self.disk_order[idx+1]
+                        )
+                        rebuild_disk_controls()
+
+                up.connect("clicked", move_up)
+                down.connect("clicked", move_down)
+                top.append(up)
+                top.append(down)
+
+                sw = self.disk_vars.get(key)
+                if sw is None:
+                    sw = Gtk.Switch(active=bool(saved_disks.get(key, True)))
+                    self.disk_vars[key] = sw
+                top.append(sw)
+
+                name_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                name_row.set_margin_start(16)
+                card.append(name_row)
+                name_row.append(Gtk.Label(label="Custom name", xalign=0))
+
+                entry = self.disk_name_entries.get(key)
+                if entry is None:
+                    entry = Gtk.Entry()
+                    entry.set_text(saved_names.get(key, ""))
+                    self.disk_name_entries[key] = entry
+                entry.set_hexpand(True)
+                entry.set_placeholder_text("Use detected name")
+                name_row.append(entry)
+
+        rebuild_disk_controls()
 
         self.display_box.append(Gtk.Separator())
         self.display_box.append(Gtk.Label(label="Detected GPUs", xalign=0))
@@ -1495,6 +2210,21 @@ class ConfigWindow(Gtk.ApplicationWindow):
             mode.connect("changed", update_entry)
             update_entry(mode)
             self.gpu_name_widgets[g["key"]] = (mode, custom)
+
+        if len(self.hardware.get("gpus", [])) > 1:
+            self.switch(
+                "compact_gpu_trends",
+                "Compact GPU trends",
+                self.display_box,
+                False
+            )
+            compact_gpu_note = Gtk.Label(
+                label="Use one shared GPU utilization graph with one color-coded trace per enabled GPU.",
+                xalign=0,
+                wrap=True,
+            )
+            compact_gpu_note.add_css_class("muted")
+            self.display_box.append(compact_gpu_note)
 
         # Intel-specific engine controls are only relevant when Intel graphics
         # is actually present.
@@ -1576,6 +2306,21 @@ class ConfigWindow(Gtk.ApplicationWindow):
         out["width"] = int(out["width"])
         out["gap_x"] = int(out.get("gap_x",12))
         out["gap_y"] = int(out.get("gap_y",40))
+        out["network_enabled"] = {
+            k: v.get_active()
+            for k, v in self.network_vars.items()
+        }
+        out["network_names"] = {
+            key: entry.get_text()
+            for key, entry in self.network_name_entries.items()
+        }
+        out["network_order"] = list(self.network_order)
+        out["disk_enabled"] = {k:v.get_active() for k,v in self.disk_vars.items()}
+        out["disk_names"] = {
+            key: entry.get_text()
+            for key, entry in self.disk_name_entries.items()
+        }
+        out["disk_order"] = list(self.disk_order)
         out["gpu_enabled"] = {k:v.get_active() for k,v in self.gpu_vars.items()}
         out["gpu_names"] = {
             key: {
